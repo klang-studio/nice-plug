@@ -220,6 +220,13 @@ impl<A: NiceEguiApp> Editor for EguiEditor<A> {
             host,
         )?;
 
+        // The window already knows its scale factor (e.g. from `Xft.dpi` on X11). Store it right
+        // away: hosts query the size with `Editor::size()` before the first `resized()` callback,
+        // and would otherwise size the window for a scale factor of 1.
+        egui_state
+            .system_scale_factor
+            .store(Some(window.size().scale_factor as f32));
+
         self.egui_state.open.store(true, Ordering::Release);
 
         Ok(SpawnedEditor {
