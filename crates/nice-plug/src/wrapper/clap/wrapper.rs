@@ -3375,13 +3375,10 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
         };
 
-        if wrapper.current_process_mode.swap(mode) != mode
-            && wrapper.is_activated.load(Ordering::SeqCst)
-        {
-            // We may change process mode while activated. In that case, restart the audio processor
-            // so the plugin can react to the process mode change in `Plugin::activate`.
-            wrapper.request_restart();
-        }
+        // Klopfer patch: only store the mode, like NIH-plug did. Requesting a restart while active
+        // lets REAPER deactivate the plugin in the middle of a render, which cuts off or silences
+        // the rendered audio. The plugin sees the new mode with its next activation.
+        wrapper.current_process_mode.store(mode);
 
         true
     }
