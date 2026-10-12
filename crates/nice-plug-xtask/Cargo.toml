@@ -1,4 +1,6 @@
 [package]
+# Explicit, so the crates also find this workspace as path dependencies nested in another one
+workspace = "../.."
 name = "nice-plug-xtask"
 version = "0.1.1"
 edition.workspace = true
