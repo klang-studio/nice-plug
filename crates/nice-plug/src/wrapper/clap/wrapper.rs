@@ -166,9 +166,10 @@ struct RestoredParameterRevisions {
 }
 
 #[derive(Clone, Copy)]
-enum DeferredRelease {
-    Note(clap_event_note),
-    Midi(clap_event_midi),
+enum DeferredVoiceEvent {
+    NoteRelease(clap_event_note),
+    MidiRelease(clap_event_midi),
+    Modulation(DeferredParameter),
 }
 
 /// Protect against OOM issues when loading malformed state.
@@ -290,6 +291,9 @@ fn advance_transport_bar(
     context: &clap_event_transport,
     elapsed_samples: usize,
 ) {
+    if context.flags & CLAP_TRANSPORT_HAS_BEATS_TIMELINE == 0 {
+        return;
+    }
     let bar_start = context.bar_start as f64 / CLAP_BEATTIME_FACTOR as f64;
     transport.bar_start_pos_beats = Some(bar_start);
     transport.bar_number = Some(context.bar_number);
@@ -371,7 +375,7 @@ pub struct Wrapper<P: ClapPlugin> {
     /// Coordinates off-audio state changes with process and parameter flush.
     state_access: StateAccess,
     deferred_parameters: ArrayQueue<DeferredParameter>,
-    deferred_releases: ArrayQueue<DeferredRelease>,
+    deferred_voice_events: ArrayQueue<DeferredVoiceEvent>,
     reconcile_voices: AtomicBool,
     revision: AtomicU64,
     restored_parameter_revisions: HashMap<u32, RestoredParameterRevisions>,
@@ -566,14 +570,7 @@ impl<P: ClapPlugin> EventLoop<Task<P>, Wrapper<P>> for Wrapper<P> {
             self.execute(task, true);
             true
         } else {
-            let success = self.tasks.push(task).is_ok();
-            if success {
-                // CLAP lets us use the host's event loop instead of having to implement our own
-                let host = &self.host_callback;
-                unsafe_clap_call! { host=>request_callback(&**host) };
-            }
-
-            success
+            self.enqueue_gui_task(task)
         }
     }
 
@@ -804,7 +801,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             )),
             state_access: StateAccess::default(),
             deferred_parameters: ArrayQueue::new(DEFERRED_EVENT_QUEUE_CAPACITY),
-            deferred_releases: ArrayQueue::new(DEFERRED_EVENT_QUEUE_CAPACITY),
+            deferred_voice_events: ArrayQueue::new(DEFERRED_EVENT_QUEUE_CAPACITY),
             reconcile_voices: AtomicBool::new(false),
             revision: AtomicU64::new(1),
             restored_parameter_revisions: param_by_hash
@@ -1110,6 +1107,15 @@ impl<P: ClapPlugin> Wrapper<P> {
         self.revision.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Queue a main-thread notification without invoking editor code on the calling stack.
+    fn enqueue_gui_task(&self, task: Task<P>) -> bool {
+        let queued = self.tasks.push(task).is_ok();
+        if queued {
+            self.request_main_callback();
+        }
+        queued
+    }
+
     fn request_main_callback(&self) {
         if let Some(request_callback) = self.host_callback.request_callback {
             unsafe { request_callback(&*self.host_callback) };
@@ -1155,12 +1161,11 @@ impl<P: ClapPlugin> Wrapper<P> {
 
                             #[cfg(feature = "editor")]
                             {
-                                // The GUI needs to be informed about the changed parameter value. This
-                                // triggers an `Editor::param_value_changed()` call on the GUI thread.
-                                let task_posted = self.schedule_gui(Task::ParameterValueChanged(
-                                    hash,
-                                    normalized_value,
-                                ));
+                                // Even an inactive flush can hold the state gate on the main
+                                // thread. Notify later so the editor can synchronously restore a preset.
+                                let task_posted = self.enqueue_gui_task(
+                                    Task::ParameterValueChanged(hash, normalized_value),
+                                );
                                 crate::nice_debug_assert!(
                                     task_posted,
                                     "The task queue is full, dropping task..."
@@ -1185,7 +1190,7 @@ impl<P: ClapPlugin> Wrapper<P> {
 
                             #[cfg(feature = "editor")]
                             {
-                                let task_posted = self.schedule_gui(
+                                let task_posted = self.enqueue_gui_task(
                                     Task::ParameterModulationChanged(hash, normalized_delta),
                                 );
                                 crate::nice_debug_assert!(
@@ -1211,7 +1216,7 @@ impl<P: ClapPlugin> Wrapper<P> {
     unsafe fn handle_flush_events(&self, in_: Option<&clap_input_events>) {
         let mut input_events = self.input_events.borrow_mut();
         input_events.clear();
-        self.replay_parameters(&mut input_events, 0, false);
+        self.replay_parameters(&mut input_events, 0);
         let Some(in_) = in_ else { return };
 
         unsafe {
@@ -1224,7 +1229,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                 if let Some(parameter) = DeferredParameter::from_event(header, 0)
                     && self.is_per_note_modulation(parameter)
                 {
-                    self.deferred_parameters.force_push(parameter);
+                    self.defer_voice_modulation(parameter);
                 } else {
                     self.handle_input_event(event, &mut input_events, None, 0, 0);
                 }
@@ -1258,14 +1263,18 @@ impl<P: ClapPlugin> Wrapper<P> {
         let mut input_events = self.input_events.borrow_mut();
         input_events.clear();
         if current_sample_idx == 0 {
-            self.replay_parameters(&mut input_events, total_buffer_len, true);
+            self.replay_parameters(&mut input_events, total_buffer_len);
             for _ in 0..DEFERRED_EVENT_QUEUE_CAPACITY {
-                let Some(event) = self.deferred_releases.pop() else {
+                let Some(event) = self.deferred_voice_events.pop() else {
                     break;
                 };
                 let header = match &event {
-                    DeferredRelease::Note(note) => &note.header,
-                    DeferredRelease::Midi(midi) => &midi.header,
+                    DeferredVoiceEvent::NoteRelease(note) => &note.header,
+                    DeferredVoiceEvent::MidiRelease(midi) => &midi.header,
+                    DeferredVoiceEvent::Modulation(parameter) => {
+                        self.replay_parameter(*parameter, &mut input_events, total_buffer_len);
+                        continue;
+                    }
                 };
                 // The header is embedded in the original complete event, now owned by us.
                 unsafe {
@@ -1332,8 +1341,13 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
             let size = header.size as usize;
             if let Some(parameter) = unsafe { DeferredParameter::from_event(event, revision) } {
-                // If the host exceeds the backlog, retain its newest parameter updates.
-                self.deferred_parameters.force_push(parameter);
+                if self.is_per_note_modulation(parameter) {
+                    self.defer_voice_modulation(parameter);
+                } else {
+                    // If the host exceeds the backlog, retain its newest global updates.
+                    self.deferred_parameters.force_push(parameter);
+                }
+                continue;
             }
 
             if !include_releases || P::MIDI_INPUT < MidiConfig::Basic {
@@ -1345,7 +1359,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                 {
                     let mut note = unsafe { *event.cast::<clap_event_note>() };
                     note.header.time = 0;
-                    Some(DeferredRelease::Note(note))
+                    Some(DeferredVoiceEvent::NoteRelease(note))
                 }
                 CLAP_EVENT_MIDI if size >= mem::size_of::<clap_event_midi>() => {
                     let mut midi = unsafe { *event.cast::<clap_event_midi>() };
@@ -1358,12 +1372,12 @@ impl<P: ClapPlugin> Wrapper<P> {
                         continue;
                     }
                     midi.header.time = 0;
-                    Some(DeferredRelease::Midi(midi))
+                    Some(DeferredVoiceEvent::MidiRelease(midi))
                 }
                 _ => None,
             };
             if let Some(release) = release
-                && self.deferred_releases.push(release).is_err()
+                && self.deferred_voice_events.push(release).is_err()
             {
                 // The next admitted process will reset voices if a release could not be saved.
                 self.reconcile_voices.store(true, Ordering::Release);
@@ -1371,10 +1385,10 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
     }
 
-    fn clear_deferred_releases(&self) {
+    fn clear_deferred_voice_events(&self) {
         self.reconcile_voices.store(false, Ordering::Release);
         for _ in 0..DEFERRED_EVENT_QUEUE_CAPACITY {
-            if self.deferred_releases.pop().is_none() {
+            if self.deferred_voice_events.pop().is_none() {
                 break;
             }
         }
@@ -1387,73 +1401,83 @@ impl<P: ClapPlugin> Wrapper<P> {
             && self.poly_mod_ids_by_hash.contains_key(&parameter.param_id)
     }
 
+    fn defer_voice_modulation(&self, parameter: DeferredParameter) {
+        // The bounded queue preserves arrival order for voice events. Modulation cannot evict
+        // queued releases, since losing those can leave notes held indefinitely.
+        let _ = self
+            .deferred_voice_events
+            .push(DeferredVoiceEvent::Modulation(parameter));
+    }
+
     fn replay_parameters(
         &self,
         input_events: &mut AtomicRefMut<VecDeque<PluginNoteEvent<P>>>,
         total_buffer_len: usize,
-        deliver_note_events: bool,
     ) {
-        // CLAP excludes concurrent process and flush calls. Rotate existing per-note modulation
-        // to the back during a flush, preserving its order for the next process block.
-        for _ in 0..self.deferred_parameters.len() {
+        for _ in 0..DEFERRED_EVENT_QUEUE_CAPACITY {
             let Some(parameter) = self.deferred_parameters.pop() else {
                 break;
             };
-            if !deliver_note_events && self.is_per_note_modulation(parameter) {
-                self.deferred_parameters.force_push(parameter);
-                continue;
-            }
-            let DeferredParameter {
+            self.replay_parameter(parameter, input_events, total_buffer_len);
+        }
+    }
+
+    fn replay_parameter(
+        &self,
+        parameter: DeferredParameter,
+        input_events: &mut AtomicRefMut<VecDeque<PluginNoteEvent<P>>>,
+        total_buffer_len: usize,
+    ) {
+        let DeferredParameter {
+            param_id,
+            note_id,
+            value,
+            event_type,
+            revision,
+        } = parameter;
+        if event_type == CLAP_EVENT_PARAM_VALUE
+            && self
+                .restored_parameter_revisions
+                .get(&param_id)
+                .is_some_and(|cutoff| revision < cutoff.incoming.load(Ordering::Relaxed))
+        {
+            return;
+        }
+        let header = |size: usize| clap_event_header {
+            size: size as u32,
+            time: 0,
+            space_id: CLAP_CORE_EVENT_SPACE_ID,
+            type_: event_type,
+            flags: 0,
+        };
+        if event_type == CLAP_EVENT_PARAM_VALUE {
+            let event = clap_event_param_value {
+                header: header(mem::size_of::<clap_event_param_value>()),
                 param_id,
                 note_id,
                 value,
-                event_type,
-                revision,
-            } = parameter;
-            if event_type == CLAP_EVENT_PARAM_VALUE
-                && self
-                    .restored_parameter_revisions
-                    .get(&param_id)
-                    .is_some_and(|cutoff| revision < cutoff.incoming.load(Ordering::Relaxed))
-            {
-                continue;
-            }
-            let header = |size: usize| clap_event_header {
-                size: size as u32,
-                time: 0,
-                space_id: CLAP_CORE_EVENT_SPACE_ID,
-                type_: event_type,
-                flags: 0,
+                cookie: std::ptr::null_mut(),
+                port_index: -1,
+                channel: -1,
+                key: -1,
             };
-            if event_type == CLAP_EVENT_PARAM_VALUE {
-                let event = clap_event_param_value {
-                    header: header(mem::size_of::<clap_event_param_value>()),
-                    param_id,
-                    note_id,
-                    value,
-                    cookie: std::ptr::null_mut(),
-                    port_index: -1,
-                    channel: -1,
-                    key: -1,
-                };
-                unsafe {
-                    self.handle_input_event(&event.header, input_events, None, 0, total_buffer_len)
-                };
-            } else {
-                let event = clap_event_param_mod {
-                    header: header(mem::size_of::<clap_event_param_mod>()),
-                    param_id,
-                    note_id,
-                    amount: value,
-                    cookie: std::ptr::null_mut(),
-                    port_index: -1,
-                    channel: -1,
-                    key: -1,
-                };
-                unsafe {
-                    self.handle_input_event(&event.header, input_events, None, 0, total_buffer_len)
-                };
-            }
+            unsafe {
+                self.handle_input_event(&event.header, input_events, None, 0, total_buffer_len)
+            };
+        } else {
+            let event = clap_event_param_mod {
+                header: header(mem::size_of::<clap_event_param_mod>()),
+                param_id,
+                note_id,
+                amount: value,
+                cookie: std::ptr::null_mut(),
+                port_index: -1,
+                channel: -1,
+                key: -1,
+            };
+            unsafe {
+                self.handle_input_event(&event.header, input_events, None, 0, total_buffer_len)
+            };
         }
     }
 
@@ -2243,7 +2267,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             loop {
                 if let Some(mut plugin) = wrapper.plugin.try_lock() {
                     plugin.reset();
-                    wrapper.clear_deferred_releases();
+                    wrapper.clear_deferred_voice_events();
                     break;
                 } else if now.elapsed() > Duration::from_millis(200) {
                     crate::nice_error!(
@@ -2294,7 +2318,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             loop {
                 if let Some(mut plugin) = wrapper.plugin.try_lock() {
                     plugin.reset();
-                    wrapper.clear_deferred_releases();
+                    wrapper.clear_deferred_voice_events();
                     break;
                 } else if now.elapsed() > Duration::from_millis(200) {
                     crate::nice_error!("Failed to acquire lock on plugin while resetting");
@@ -2348,7 +2372,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                     return CLAP_PROCESS_ERROR;
                 };
                 plugin.reset();
-                wrapper.clear_deferred_releases();
+                wrapper.clear_deferred_voice_events();
             }
             let has_main_input = current_audio_io_layout.main_input_channels.is_some();
             let has_main_output = current_audio_io_layout.main_output_channels.is_some();
@@ -2639,6 +2663,15 @@ impl<P: ClapPlugin> Wrapper<P> {
                         }
                     }
 
+                    for (id, value) in accepted.drain(..) {
+                        wrapper.update_plain_value_by_hash(
+                            id,
+                            ClapParamUpdate::PlainValueSet(value),
+                            Some(sample_rate),
+                        );
+                    }
+                    drop(accepted);
+
                     let mut context = wrapper.make_process_context(
                         transport,
                         block_end,
@@ -2647,16 +2680,6 @@ impl<P: ClapPlugin> Wrapper<P> {
                     );
 
                     let result = plugin.process(buffers.main_buffer, &mut aux, &mut context);
-                    drop(context);
-                    drop(plugin);
-                    for (id, value) in accepted.drain(..) {
-                        wrapper.update_plain_value_by_hash(
-                            id,
-                            ClapParamUpdate::PlainValueSet(value),
-                            Some(sample_rate),
-                        );
-                    }
-
                     wrapper.last_process_status.store(result);
                     result
                 } else {

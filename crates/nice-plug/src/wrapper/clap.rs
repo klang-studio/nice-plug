@@ -264,3 +264,60 @@ macro_rules! nice_export_clap {
             };
     };
 }
+
+#[cfg(test)]
+mod library_worker_tests {
+    use super::*;
+    use crate::event_loop::{BackgroundThread, MainThreadExecutor};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    type Task = Box<dyn FnOnce() + Send>;
+
+    struct Executor;
+
+    impl MainThreadExecutor<Task> for Executor {
+        fn execute(&self, task: Task, _: bool) {
+            task();
+        }
+    }
+
+    #[test]
+    fn final_deinit_waits_for_the_running_worker() {
+        const WATCHDOG: Duration = Duration::from_secs(10);
+
+        let library = LibraryWorkers::new();
+        library.initialize();
+        let executor = Arc::new(Executor);
+        let worker = BackgroundThread::get_or_create(Arc::downgrade(&executor));
+        let worker_handle = worker.worker_handle();
+        let worker_lifetime = Arc::downgrade(&worker_handle);
+        library.retain(worker_handle);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        assert!(worker.schedule(Box::new(move || {
+            started_tx.send(()).unwrap();
+            finish_rx.recv_timeout(WATCHDOG).unwrap();
+        })));
+        started_rx.recv_timeout(WATCHDOG).unwrap();
+        drop(worker);
+
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let deinit = thread::spawn(move || {
+            library.deinitialize();
+            returned_tx.send(()).unwrap();
+        });
+        let deadline = Instant::now() + WATCHDOG;
+        // A zero count means deinit has dropped the last handle and entered the worker's destructor.
+        while worker_lifetime.strong_count() != 0 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let result_while_blocked = returned_rx.recv_timeout(Duration::from_millis(50));
+        finish_tx.send(()).unwrap();
+        assert_eq!(result_while_blocked, Err(mpsc::RecvTimeoutError::Timeout));
+        returned_rx.recv_timeout(WATCHDOG).unwrap();
+        deinit.join().unwrap();
+    }
+}

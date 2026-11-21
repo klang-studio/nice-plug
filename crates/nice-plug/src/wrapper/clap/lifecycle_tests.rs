@@ -4,7 +4,7 @@ use std::ptr;
 thread_local! {
     static RELEASES: Cell<usize> = const { Cell::new(0) };
     static PEDAL_RELEASES: Cell<usize> = const { Cell::new(0) };
-    static VOICE_MODULATION: Cell<Option<f32>> = const { Cell::new(None) };
+    static VOICE_MODULATION: Cell<Option<(f32, usize)>> = const { Cell::new(None) };
     static FLUSH_DURING_RESTORE: Cell<Option<(*const clap_plugin, *const clap_input_events)>> = const { Cell::new(None) };
     static FLUSH_REQUESTS: Cell<usize> = const { Cell::new(0) };
     static MAIN_CALLBACKS: Cell<usize> = const { Cell::new(0) };
@@ -108,7 +108,7 @@ impl Plugin for TestPlugin {
                     voice_id: 42,
                     poly_modulation_id: 0,
                     normalized_offset,
-                } => VOICE_MODULATION.set(Some(normalized_offset)),
+                } => VOICE_MODULATION.set(Some((normalized_offset, RELEASES.get()))),
                 _ => {}
             }
         }
@@ -369,7 +369,7 @@ fn state_contention_silences_audio_and_replays_releases_and_parameter_flushes() 
         );
         assert_eq!(RELEASES.get(), 1);
         assert_eq!(PEDAL_RELEASES.get(), 1);
-        assert_eq!(VOICE_MODULATION.replace(None), Some(0.125));
+        assert_eq!(VOICE_MODULATION.replace(None), Some((0.125, 1)));
         assert_ne!(
             Wrapper::<TestPlugin>::process(plugin, &process),
             CLAP_PROCESS_ERROR
@@ -399,7 +399,7 @@ fn state_contention_silences_audio_and_replays_releases_and_parameter_flushes() 
         );
         assert_eq!(RESETS.get(), previous_resets + 1);
         assert_eq!(RELEASES.get(), 1);
-        assert!(wrapper.deferred_releases.is_empty());
+        assert!(wrapper.deferred_voice_events.is_empty());
         Wrapper::<TestPlugin>::stop_processing(plugin);
         Wrapper::<TestPlugin>::deactivate(plugin);
     }
@@ -530,6 +530,15 @@ fn sliced_transport_advances_bars_on_the_hosts_grid() {
     advance_transport_bar(&mut transport, &context, 1);
     assert_eq!(transport.bar_start_pos_beats(), Some(3.0));
     assert_eq!(transport.bar_number(), Some(1));
+
+    let mut no_beat_timeline = Transport::new(48_000.0);
+    let snapshot = clap_event_transport {
+        flags: 0,
+        ..context
+    };
+    advance_transport_bar(&mut no_beat_timeline, &snapshot, 0);
+    assert_eq!(no_beat_timeline.bar_start_pos_beats(), None);
+    assert_eq!(no_beat_timeline.bar_number(), None);
 }
 
 const HOST_PARAMS: clap_host_params = clap_host_params {
@@ -714,15 +723,62 @@ struct TestEditor {
 }
 
 #[cfg(feature = "editor")]
+struct TestEditorHandle {
+    context: GuiContext,
+    preset: Mutex<Option<PluginState>>,
+}
+
+#[cfg(feature = "editor")]
+impl nice_plug_core::editor::EditorHandle for TestEditorHandle {
+    type Window = ();
+    type Error = std::convert::Infallible;
+
+    fn run_until_closed(_: ()) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn set_parent(
+        &self,
+        _: nice_plug_core::editor::ParentWindowHandle,
+        _: &(),
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn show(&self, _: &()) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn hide(&self, _: &()) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn set_size(
+        &self,
+        _: nice_plug_core::editor::dpi::NativeSize<u32>,
+        _: &(),
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn host_main_thread_callback(&self, _: &()) {}
+    fn param_modulation_changed(&self, _: &str, _: f32) {}
+
+    fn param_value_changed(&self, id: &str, _: f32) {
+        if id == "gain" {
+            let preset = self.preset.lock().take();
+            if let Some(preset) = preset {
+                self.context.set_state(preset);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "editor")]
 impl Editor for TestEditor {
-    type Handle = ();
+    type Handle = TestEditorHandle;
 
     fn spawn(
         &self,
         _: Option<nice_plug_core::editor::ParentWindowHandle>,
         _: bool,
         _: Option<f64>,
-        _: GuiContext,
+        context: GuiContext,
         host: Option<nice_plug_core::editor::HostMethods>,
     ) -> Result<SpawnedEditor<Self::Handle>, Box<dyn std::error::Error>> {
         use nice_plug_core::editor::dpi::{PhysicalSize, Size};
@@ -734,13 +790,77 @@ impl Editor for TestEditor {
         );
         host.callbacks.destroyed();
         Ok(SpawnedEditor {
-            handle: (),
+            handle: TestEditorHandle {
+                context,
+                preset: Mutex::new(None),
+            },
             window: (),
         })
     }
 
     fn size(&self) -> nice_plug_core::editor::dpi::NativeSize<u32> {
         nice_plug_core::editor::dpi::NativeSize::new(100, 100)
+    }
+}
+
+#[cfg(feature = "editor")]
+#[test]
+fn inactive_flush_defers_editor_preset_restore_until_the_gate_is_released() {
+    use nice_plug_core::plugin::ParamValue;
+
+    let host = clap_host {
+        get_extension: Some(params_extension),
+        request_callback: Some(record_callback),
+        ..HOST
+    };
+    // SAFETY: The host and borrowed events outlive the callbacks below.
+    unsafe {
+        let wrapper = Wrapper::<TestPlugin>::new(&host).unwrap();
+        let plugin = wrapper.clap_plugin.as_ptr();
+        assert!(Wrapper::<TestPlugin>::init(plugin));
+        let context = wrapper.clone().make_gui_context();
+        let mut preset = context.get_state();
+        preset.params.insert("gain".into(), ParamValue::F32(0.75));
+        *wrapper.editor_window.borrow_mut() = Some(fragile::Fragile::new(SpawnedEditor {
+            handle: TestEditorHandle {
+                context,
+                preset: Mutex::new(Some(preset)),
+            },
+            window: (),
+        }));
+        let event = clap_event_param_value {
+            header: clap_event_header {
+                size: mem::size_of::<clap_event_param_value>() as u32,
+                time: 0,
+                space_id: CLAP_CORE_EVENT_SPACE_ID,
+                type_: CLAP_EVENT_PARAM_VALUE,
+                flags: 0,
+            },
+            param_id: Wrapper::<TestPlugin>::custom_extension_param_id(plugin, "gain").unwrap(),
+            cookie: ptr::null_mut(),
+            note_id: -1,
+            port_index: -1,
+            channel: -1,
+            key: -1,
+            value: 0.25,
+        };
+        let headers = [&event.header as *const _];
+        let input = input_event_list(&headers);
+        MAIN_CALLBACKS.set(0);
+        RESCANS.set(0);
+        Wrapper::<TestPlugin>::ext_params_flush(plugin, &input, ptr::null());
+        assert_eq!(MAIN_CALLBACKS.get(), 1);
+        assert_eq!(RESCANS.get(), 0);
+        assert!(matches!(
+            wrapper.get_state_object().params.get("gain"),
+            Some(ParamValue::F32(0.25))
+        ));
+        Wrapper::<TestPlugin>::on_main_thread(plugin);
+        assert_eq!(RESCANS.get(), 1);
+        assert!(matches!(
+            wrapper.get_state_object().params.get("gain"),
+            Some(ParamValue::F32(0.75))
+        ));
     }
 }
 

@@ -1,8 +1,8 @@
 use std::sync::Mutex;
 
 use crate::prelude::{
-    AudioIOLayout, AuxiliaryBuffers, Buffer, Enum, EnumParam, FloatParam, FloatRange, IntParam,
-    ProcessContext, ProcessStatus,
+    AudioIOLayout, AuxiliaryBuffers, BoolParam, Buffer, Enum, EnumParam, FloatParam, FloatRange,
+    IntParam, ProcessContext, ProcessStatus,
 };
 
 use super::*;
@@ -17,6 +17,7 @@ enum Mode {
 
 struct StateParams {
     gain: FloatParam,
+    enabled: BoolParam,
     steps: IntParam,
     mode: EnumParam<Mode>,
     secondary: EnumParam<Mode>,
@@ -42,6 +43,7 @@ impl Default for StateParams {
                     factor: 2.0,
                 }),
             ),
+            enabled: BoolParam::new("Enabled", true),
             steps: IntParam::new(
                 "Steps",
                 1,
@@ -72,9 +74,10 @@ unsafe impl Params for StateParams {
 }
 
 impl StateParams {
-    fn lookup(&self) -> [(&str, ParamPtr); 5] {
+    fn lookup(&self) -> [(&str, ParamPtr); 6] {
         [
             ("gain", self.gain.as_ptr()),
+            ("enabled", self.enabled.as_ptr()),
             ("steps", self.steps.as_ptr()),
             ("mode", self.mode.as_ptr()),
             ("secondary", self.secondary.as_ptr()),
@@ -226,6 +229,36 @@ fn enum_restore_updates_the_base_under_modulation_without_repeating_callbacks() 
     assert!(!unsafe { mode._internal_modulate_value(0.0) });
     assert_eq!(mode.value(), Mode::On);
     assert!(plugin.0.enum_changes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn restore_commits_float_and_bool_bases_masked_by_modulation() {
+    let plugin = StatePlugin::default();
+    let gain = &plugin.0.gain;
+    let enabled = &plugin.0.enabled;
+    // SAFETY: The test owns these parameters and no processing is active.
+    unsafe {
+        gain._internal_modulate_value(-1.0);
+        enabled._internal_modulate_value(1.0);
+    }
+    assert_eq!(gain.value(), 1.0);
+    assert!(enabled.value());
+
+    let json = br#"{"version":"1.0.0","params":{"gain":{"f32":0.75},"enabled":{"bool":false}},"fields":{}}"#;
+    let mut state = deserialize_json_bounded(json, json.len()).unwrap();
+    assert!(apply(&mut state, &plugin));
+    assert_eq!(gain.value(), 1.0);
+    assert!(enabled.value());
+    assert_eq!(gain.unmodulated_plain_value(), 0.75);
+    assert!(!enabled.unmodulated_plain_value());
+
+    // SAFETY: No processing can observe these parameters concurrently.
+    unsafe {
+        gain._internal_modulate_value(0.0);
+        enabled._internal_modulate_value(0.0);
+    }
+    assert_eq!(gain.value(), 0.75);
+    assert!(!enabled.value());
 }
 
 #[test]

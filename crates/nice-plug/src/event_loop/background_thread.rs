@@ -222,7 +222,6 @@ mod tests {
         worker.close();
         assert!(!worker.schedule(Box::new(|| panic!("closed task was queued"))));
         drop(worker);
-        drop(first);
 
         let (peer_tx, peer_rx) = mpsc::channel();
         assert!(peer_worker.schedule(Box::new(move || peer_tx.send(()).unwrap())));
@@ -232,5 +231,6 @@ mod tests {
             cancelled_rx.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
+        drop(first);
     }
 }

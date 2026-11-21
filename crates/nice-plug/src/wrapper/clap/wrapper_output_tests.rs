@@ -100,6 +100,7 @@ unsafe extern "C" fn request_callback(host: *const clap_host) {
 struct Output {
     limit: usize,
     events: Vec<(u32, u16)>,
+    reject_parameter_values: bool,
 }
 
 unsafe extern "C" fn try_push(
@@ -107,10 +108,12 @@ unsafe extern "C" fn try_push(
     event: *const clap_event_header,
 ) -> bool {
     let output = unsafe { &mut *(*events).ctx.cast::<Output>() };
-    if output.events.len() == output.limit {
+    let event = unsafe { &*event };
+    if output.events.len() == output.limit
+        || (output.reject_parameter_values && event.type_ == CLAP_EVENT_PARAM_VALUE)
+    {
         return false;
     }
-    let event = unsafe { &*event };
     output.events.push((event.time, event.type_));
     true
 }
@@ -146,6 +149,7 @@ fn rejected_parameter_event_keeps_its_fifo_position_until_accepted() {
     let mut output = Output {
         limit: 1,
         events: Vec::with_capacity(4),
+        reject_parameter_values: false,
     };
     let callbacks = clap_output_events {
         ctx: ptr::from_mut(&mut output).cast(),
@@ -175,7 +179,7 @@ fn rejected_parameter_event_keeps_its_fifo_position_until_accepted() {
 }
 
 #[test]
-fn parameter_output_precedes_notes_without_applying_the_dsp_value_early() {
+fn parameter_output_applies_only_accepted_values_before_the_slice() {
     unsafe extern "C" fn input_size(_: *const clap_input_events) -> u32 {
         1
     }
@@ -216,6 +220,7 @@ fn parameter_output_precedes_notes_without_applying_the_dsp_value_early() {
     let mut output = Output {
         limit: 4,
         events: Vec::with_capacity(4),
+        reject_parameter_values: false,
     };
     let callbacks = clap_output_events {
         ctx: ptr::from_mut(&mut output).cast(),
@@ -259,6 +264,20 @@ fn parameter_output_precedes_notes_without_applying_the_dsp_value_early() {
         in_events: &inputs,
         out_events: &callbacks,
     };
+    output.reject_parameter_values = true;
+    OBSERVED_GAINS.set((None, None));
+    assert_ne!(
+        unsafe { Wrapper::<QueueProbe>::process(plugin, &process) },
+        CLAP_PROCESS_ERROR
+    );
+    assert_eq!(
+        output.events,
+        [(5, CLAP_EVENT_NOTE_ON), (13, CLAP_EVENT_NOTE_ON)]
+    );
+    assert_eq!(OBSERVED_GAINS.get(), (Some(0.375), Some(0.375)));
+    output.events.clear();
+    output.reject_parameter_values = false;
+
     OBSERVED_GAINS.set((None, None));
     assert_ne!(
         unsafe { Wrapper::<QueueProbe>::process(plugin, &process) },
@@ -276,7 +295,7 @@ fn parameter_output_precedes_notes_without_applying_the_dsp_value_early() {
             (13, CLAP_EVENT_NOTE_ON),
         ]
     );
-    assert_eq!(OBSERVED_GAINS.get(), (Some(0.375), Some(0.75)));
+    assert_eq!(OBSERVED_GAINS.get(), (Some(0.75), Some(0.75)));
     let mut value = 0.0;
     assert!(unsafe { Wrapper::<QueueProbe>::ext_params_get_value(plugin, id, &mut value) });
     assert_eq!(value, 0.75);
@@ -324,6 +343,7 @@ fn successful_restore_supersedes_older_matching_values_but_preserves_gestures_an
     let mut output = Output {
         limit: 1,
         events: Vec::with_capacity(5),
+        reject_parameter_values: false,
     };
     let callbacks = clap_output_events {
         ctx: ptr::from_mut(&mut output).cast(),
