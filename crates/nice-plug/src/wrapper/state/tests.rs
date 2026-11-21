@@ -113,6 +113,13 @@ impl Plugin for StatePlugin {
         ProcessStatus::Normal
     }
 
+    fn validate_state(state: &PluginState) -> bool {
+        state
+            .fields
+            .get("remembered")
+            .is_none_or(|value| !value.is_empty())
+    }
+
     fn filter_state(state: &mut PluginState) {
         if state.version.is_empty()
             && let Some(ParamValue::Bool(enabled)) = state.params.get("gain")
@@ -325,4 +332,18 @@ fn state_encoding_and_decoding_share_the_stored_payload_limit() {
         corrupted.extend_from_slice(b"trailing garbage");
         assert!(deserialize_json_bounded(&corrupted, corrupted.len()).is_none());
     }
+}
+
+#[test]
+fn rejected_persistent_field_leaves_parameters_and_fields_unchanged() {
+    let plugin = StatePlugin::default();
+    *plugin.0.remembered.lock().unwrap() = Some("existing".into());
+    let json = br#"{"params":{"gain":{"f32":0.25}},"fields":{"remembered":""}}"#;
+    let mut state = deserialize_json_bounded(json, json.len()).unwrap();
+    assert!(!apply(&mut state, &plugin));
+    assert_eq!(plugin.0.gain.value(), 0.5);
+    assert_eq!(
+        *plugin.0.remembered.lock().unwrap(),
+        Some("existing".into())
+    );
 }

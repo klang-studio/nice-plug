@@ -220,6 +220,12 @@ pub trait Plugin: Default + Send + 'static {
     /// This is an advanced feature that the vast majority of plugins won't need to implement.
     fn filter_state(state: &mut PluginState) {}
 
+    /// Validate a decoded state after [`Self::filter_state()`] and before any live parameters
+    /// or persisted fields are changed. Return `false` to reject the entire restore.
+    fn validate_state(_state: &PluginState) -> bool {
+        true
+    }
+
     //
     // The following functions follow the lifetime of the plugin.
     //

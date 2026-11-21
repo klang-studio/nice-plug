@@ -166,8 +166,7 @@ fn int_range_contains(range: IntRange, value: i32) -> bool {
 /// Make sure to reactivate plugin after deserializing the state so it can react to the new
 /// parameter values. The smoothers have already been reset by this function.
 ///
-/// The [`Plugin`] argument is used to call [`Plugin::filter_state()`] just before loading the
-/// state.
+/// The [`Plugin`] argument supplies the migration and preflight validation hooks.
 pub(crate) unsafe fn deserialize_object<P: Plugin>(
     state: &mut PluginState,
     plugin_params: Arc<dyn Params>,
@@ -176,6 +175,10 @@ pub(crate) unsafe fn deserialize_object<P: Plugin>(
 ) -> bool {
     // This lets the plugin perform migrations on old state if needed
     P::filter_state(state);
+    if !P::validate_state(state) {
+        crate::nice_warn!("Plugin rejected the serialized state");
+        return false;
+    }
 
     // Validate after migration and resolve stable enum IDs before calling any setters.
     // IDs removed in a newer version remain compatible.
