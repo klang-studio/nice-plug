@@ -21,21 +21,15 @@ use std::mem;
 use super::wrapper::{Task, Wrapper};
 use crate::event_loop::EventLoop;
 use crate::wrapper::clap::ClapPlugin;
-use crate::wrapper::util::{clamp_output_event_timing, strlcpy};
+use crate::wrapper::util::strlcpy;
 
-/// An [`ActivateContext`] implementation for the wrapper.
-///
-/// # Note
-///
-/// See the VST3 `WrapperActivateContext` for an explanation of why we need this `pending_requests`
-/// field.
+/// An [`ActivateContext`] implementation that defers latency changes until activation succeeds.
 pub(crate) struct WrapperActivateContext<'a, P: ClapPlugin> {
     pub(super) wrapper: &'a Wrapper<P>,
     pub(super) pending_requests: PendingActivateContextRequests,
 }
 
-/// Any requests that should be sent out when the [`WrapperActivateContext`] is dropped. See that
-/// struct's docstring for mroe information.
+/// Requests collected during activation, before notifying the host.
 #[derive(Debug, Default)]
 pub(crate) struct PendingActivateContextRequests {
     /// The value of the last `.set_latency_samples()` call.
@@ -50,9 +44,10 @@ pub(crate) struct WrapperProcessContext<'a, P: ClapPlugin> {
     pub(super) input_events_guard: AtomicRefMut<'a, VecDeque<PluginNoteEvent<P>>>,
     //pub(super) output_events_guard: AtomicRefMut<'a, VecDeque<PluginNoteEvent<P>>>,
     pub(super) transport: Transport,
-    // used to clamp out of bounds events to the buffer's length.
-    pub(super) total_buffer_len: u32,
+    // Exclusive end of this slice in host block coordinates.
+    pub(super) end_sample_idx: u32,
     pub(super) current_sample_idx: u32,
+    pub(super) last_output_time: u32,
     pub(super) host_out_events: *const clap_output_events,
 }
 
@@ -77,11 +72,9 @@ pub(crate) struct RemoteControlPages<'a> {
     pages: &'a mut Vec<clap_remote_controls_page>,
 }
 
-impl<P: ClapPlugin> Drop for WrapperActivateContext<'_, P> {
-    fn drop(&mut self) {
-        if let Some(samples) = self.pending_requests.latency_changed.take() {
-            self.wrapper.set_latency_samples(samples)
-        }
+impl<P: ClapPlugin> WrapperActivateContext<'_, P> {
+    pub(super) fn requested_latency(&self) -> Option<u32> {
+        self.pending_requests.latency_changed.get()
     }
 }
 
@@ -147,11 +140,13 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
             return Err((event, SendEventError::NoOutputBuffer));
         }
 
-        // Out of bounds events are clamped to the buffer's size
-        let time = clamp_output_event_timing(
-            event.timing() + self.current_sample_idx,
-            self.total_buffer_len,
-        );
+        // CLAP outputs are streaming and sorted. Keep notes inside this slice and never
+        // append a timestamp earlier than the one last accepted by the host.
+        let time = event
+            .timing()
+            .saturating_add(self.current_sample_idx)
+            .min(self.end_sample_idx.saturating_sub(1))
+            .max(self.last_output_time);
 
         fn voice_to_i32(voice_id: VoiceID) -> i32 {
             voice_id.id().unwrap_or(-1)
@@ -501,6 +496,7 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
         };
 
         if push_successful {
+            self.last_output_time = time;
             Ok(())
         } else {
             Err((event, SendEventError::HostBufferFull))

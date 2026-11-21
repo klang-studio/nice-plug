@@ -59,7 +59,10 @@ pub fn strlcpy(dest: &mut [c_char], src: &str) {
     let src_bytes_signed: &[c_char] = unsafe { &*(src_bytes as *const [u8] as *const [c_char]) };
 
     // Make sure there's always room for a null terminator
-    let copy_len = cmp::min(dest.len() - 1, src.len());
+    let mut copy_len = cmp::min(dest.len() - 1, src.len());
+    while !src.is_char_boundary(copy_len) {
+        copy_len -= 1;
+    }
     dest[..copy_len].copy_from_slice(&src_bytes_signed[..copy_len]);
     dest[copy_len] = 0;
 }
@@ -82,6 +85,7 @@ pub fn clamp_input_event_timing(timing: u32, total_buffer_len: u32) -> u32 {
 /// Clamp an output event's timing to the buffer length. Emits a debug assertion failure if it was
 /// out of bounds.
 #[inline]
+#[cfg(any(feature = "vst3", feature = "standalone"))]
 pub fn clamp_output_event_timing(timing: u32, total_buffer_len: u32) -> u32 {
     let last_valid_index = total_buffer_len.saturating_sub(1);
 
@@ -317,6 +321,23 @@ mod miri {
         assert_eq!(
             unsafe { CStr::from_ptr(dest.as_ptr()) }.to_str(),
             Ok("Hello")
+        );
+    }
+
+    #[test]
+    fn clap_text_is_truncated_at_a_character_boundary() {
+        let mut too_short = [0; 3];
+        strlcpy(&mut too_short, "aé");
+        assert_eq!(
+            unsafe { CStr::from_ptr(too_short.as_ptr()) }.to_bytes(),
+            b"a"
+        );
+
+        let mut fits = [0; 4];
+        strlcpy(&mut fits, "aé");
+        assert_eq!(
+            unsafe { CStr::from_ptr(fits.as_ptr()) }.to_bytes(),
+            "aé".as_bytes()
         );
     }
 }
