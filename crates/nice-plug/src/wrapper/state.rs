@@ -3,10 +3,14 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use nice_plug_core::{
     audio_setup::BufferConfig,
-    params::{InternalParamMut, Param, Params, internals::ParamPtr},
+    params::{
+        InternalParamMut, Param, Params,
+        internals::ParamPtr,
+        range::{FloatRange, IntRange},
+    },
     plugin::{ParamValue, Plugin, PluginState},
 };
 
@@ -88,34 +92,67 @@ pub(crate) unsafe fn serialize_object<'a, P: Plugin>(
     }
 }
 
-/// Serialize a plugin's state to a vector containing JSON data. This can (and should) be shared
-/// across plugin formats. If the `zstd` feature is enabled, then the state will be compressed using
-/// Zstandard.
+/// Serialize a plugin's state as JSON for the VST3 state stream.
+#[cfg(feature = "vst3")]
 pub(crate) unsafe fn serialize_json<'a, P: Plugin>(
     plugin_params: Arc<dyn Params>,
     params_iter: impl IntoIterator<Item = (&'a String, ParamPtr)>,
 ) -> Result<Vec<u8>> {
-    let plugin_state = unsafe { serialize_object::<P>(plugin_params, params_iter) };
-    let json = serde_json::to_vec(&plugin_state).context("Could not format as JSON")?;
+    unsafe { serialize_json_bounded::<P>(plugin_params, params_iter, usize::MAX) }
+}
 
+/// Serialize state with the same stored payload limit used on load.
+pub(crate) unsafe fn serialize_json_bounded<'a, P: Plugin>(
+    plugin_params: Arc<dyn Params>,
+    params_iter: impl IntoIterator<Item = (&'a String, ParamPtr)>,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    let state = unsafe { serialize_object::<P>(plugin_params, params_iter) };
+    encode_json(&state, limit)
+}
+
+fn encode_json(state: &PluginState, limit: usize) -> Result<Vec<u8>> {
     #[cfg(feature = "zstd")]
-    {
-        let compressed = zstd::encode_all(json.as_slice(), zstd::DEFAULT_COMPRESSION_LEVEL)
-            .context("Could not compress state")?;
-
-        let state_bytes = json.len();
-        let compressed_state_bytes = compressed.len();
-        let compression_ratio = compressed_state_bytes as f32 / state_bytes as f32 * 100.0;
-        nice_plug_core::nice_trace!(
-            "Compressed {state_bytes} bytes of state to {compressed_state_bytes} bytes \
-             ({compression_ratio:.1}% compression ratio)"
-        );
-
-        Ok(compressed)
-    }
+    let payload = {
+        // Write JSON straight to the compressor so large compressible states do not need a
+        // separate uncompressed buffer.
+        let encoder =
+            zstd::stream::write::Encoder::new(Vec::new(), zstd::DEFAULT_COMPRESSION_LEVEL)
+                .context("Could not create state compressor")?;
+        let mut writer = std::io::BufWriter::new(encoder);
+        serde_json::to_writer(&mut writer, state).context("Could not write compressed JSON")?;
+        writer
+            .into_inner()
+            .map_err(|error| error.into_error())
+            .context("Could not flush compressed JSON")?
+            .finish()
+            .context("Could not finish compressing state")?
+    };
     #[cfg(not(feature = "zstd"))]
-    {
-        Ok(json)
+    let payload = serde_json::to_vec(state).context("Could not format as JSON")?;
+
+    ensure!(
+        payload.len() <= limit,
+        "Stored state exceeds the size limit"
+    );
+    Ok(payload)
+}
+
+fn float_range_contains(range: FloatRange, value: f32) -> bool {
+    match range {
+        FloatRange::Linear { min, max }
+        | FloatRange::Skewed { min, max, .. }
+        | FloatRange::SymmetricalSkewed { min, max, .. } => {
+            value.is_finite() && (min..=max).contains(&value)
+        }
+        FloatRange::Reversed(range) => float_range_contains(*range, value),
+    }
+}
+
+fn int_range_contains(range: IntRange, value: i32) -> bool {
+    match range {
+        IntRange::Linear { min, max } => (min..=max).contains(&value),
+        IntRange::Reversed(range) => int_range_contains(*range, value),
     }
 }
 
@@ -140,60 +177,71 @@ pub(crate) unsafe fn deserialize_object<P: Plugin>(
     // This lets the plugin perform migrations on old state if needed
     P::filter_state(state);
 
-    let sample_rate = current_buffer_config.map(|c| c.sample_rate);
-    for (param_id_str, param_value) in &state.params {
-        let param_ptr = match params_getter(param_id_str.as_str()) {
-            Some(ptr) => ptr,
-            None => {
-                #[cfg(debug_assertions)]
-                crate::nice_warn!("Unknown parameter: {}", param_id_str);
-                continue;
-            }
+    // Validate after migration and resolve stable enum IDs before calling any setters.
+    // IDs removed in a newer version remain compatible.
+    let mut values = Vec::new();
+    for (param_id, value) in &state.params {
+        let Some(param) = params_getter(param_id) else {
+            #[cfg(debug_assertions)]
+            crate::nice_warn!("Unknown parameter: {}", param_id);
+            continue;
         };
-
-        unsafe {
-            match (param_ptr, param_value) {
-                (ParamPtr::FloatParam(p), ParamValue::F32(v)) => {
-                    (*p)._internal_set_plain_value(*v);
+        // SAFETY: The pointers come from the live parameter map supplied by the caller.
+        let value = unsafe {
+            match (param, value) {
+                (ParamPtr::FloatParam(p), ParamValue::F32(value))
+                    if float_range_contains((*p).range(), *value) =>
+                {
+                    Some(ParamValue::F32(*value))
                 }
-                (ParamPtr::IntParam(p), ParamValue::I32(v)) => {
-                    (*p)._internal_set_plain_value(*v);
+                (ParamPtr::IntParam(p), ParamValue::I32(value))
+                    if int_range_contains((*p).range(), *value) =>
+                {
+                    Some(ParamValue::I32(*value))
                 }
-                (ParamPtr::BoolParam(p), ParamValue::Bool(v)) => {
-                    (*p)._internal_set_plain_value(*v);
-                }
-                // Enums are either serialized based on the active variant's index (which may not be the
-                // same as the discriminator), or a custom set stable string ID. The latter allows the
-                // variants to be reordered.
-                (ParamPtr::EnumParam(p), ParamValue::I32(variant_idx)) => {
-                    (*p)._internal_set_plain_value(*variant_idx);
+                (ParamPtr::BoolParam(_), ParamValue::Bool(value)) => Some(ParamValue::Bool(*value)),
+                (ParamPtr::EnumParam(p), ParamValue::I32(index))
+                    if usize::try_from(*index).is_ok_and(|index| index < (*p).len()) =>
+                {
+                    Some(ParamValue::I32(*index))
                 }
                 (ParamPtr::EnumParam(p), ParamValue::String(id)) => {
-                    let deserialized_enum = (*p).set_from_id(id);
-                    if !deserialized_enum {
-                        #[cfg(debug_assertions)]
-                        crate::nice_warn!(
-                            "Unknown ID {:?} for enum parameter \"{}\"",
-                            id,
-                            param_id_str,
-                        );
-                    }
+                    (*p).index_from_id(id).map(ParamValue::I32)
                 }
-                (param_ptr, param_value) => {
-                    #[cfg(debug_assertions)]
-                    crate::nice_warn!(
-                        "Invalid serialized value {:?} for parameter \"{}\" ({:?})",
-                        param_value,
-                        param_id_str,
-                        param_ptr,
-                    );
-                }
+                _ => None,
             }
-        }
+        };
+        let Some(value) = value else {
+            crate::nice_warn!("Invalid serialized value for parameter {param_id:?}");
+            return false;
+        };
+        values.push((param, value));
+    }
 
-        // Make sure everything starts out in sync
-        if let Some(sample_rate) = sample_rate {
-            unsafe { param_ptr._internal_update_smoother(sample_rate, true) };
+    let sample_rate = current_buffer_config.map(|c| c.sample_rate);
+    for (param, value) in values {
+        // SAFETY: These are the same live parameters and validated plain values from above.
+        unsafe {
+            match (param, value) {
+                (ParamPtr::FloatParam(p), ParamValue::F32(v)) => {
+                    (*p)._internal_set_plain_value(v);
+                }
+                (ParamPtr::IntParam(p), ParamValue::I32(v)) => {
+                    (*p)._internal_set_plain_value(v);
+                }
+                (ParamPtr::BoolParam(p), ParamValue::Bool(v)) => {
+                    (*p)._internal_set_plain_value(v);
+                }
+                (ParamPtr::EnumParam(p), ParamValue::I32(v)) => {
+                    (*p)._internal_set_plain_value(v);
+                }
+                _ => unreachable!("Only validated typed values are applied"),
+            }
+
+            // Make sure everything starts out in sync.
+            if let Some(sample_rate) = sample_rate {
+                param._internal_update_smoother(sample_rate, true);
+            }
         }
     }
 
@@ -204,57 +252,38 @@ pub(crate) unsafe fn deserialize_object<P: Plugin>(
     true
 }
 
-/// Deserialize a plugin's state from a vector containing (compressed) JSON data. Doesn't load the
-/// plugin state since doing so should be accompanied by calls to `Plugin::init()` and
-/// `Plugin::reset()`, and this way all of that behavior can be encapsulated so it can be reused in
-/// multiple places. The returned state object can be passed to [`deserialize_object()`].
+/// Decode VST3 state without applying it.
+#[cfg(feature = "vst3")]
 pub(crate) unsafe fn deserialize_json(state: &[u8]) -> Option<PluginState> {
-    #[cfg(feature = "zstd")]
-    let result: Option<PluginState> = match zstd::decode_all(state) {
-        Ok(decompressed) => match serde_json::from_slice(decompressed.as_slice()) {
-            Ok(s) => {
-                let state_bytes = decompressed.len();
-                let compressed_state_bytes = state.len();
-                let compression_ratio = compressed_state_bytes as f32 / state_bytes as f32 * 100.0;
-                crate::nice_trace!(
-                    "Inflated {compressed_state_bytes} bytes of state to {state_bytes} bytes \
-                     ({compression_ratio:.1}% compression ratio)"
-                );
+    deserialize_json_bounded(state, usize::MAX)
+}
 
-                Some(s)
-            }
-            Err(err) => {
-                crate::nice_debug_assert_failure!("Error while deserializing state: {}", err);
-                None
-            }
-        },
-        // Uncompressed state files can still be loaded after enabling this feature to prevent
-        // breaking existing plugin instances
-        Err(zstd_err) => match serde_json::from_slice(state) {
-            Ok(s) => {
-                crate::nice_trace!("Older uncompressed state found");
-                Some(s)
-            }
-            Err(json_err) => {
-                crate::nice_debug_assert_failure!(
-                    "Error while deserializing state as either compressed or uncompressed state: \
-                     {}, {}",
-                    zstd_err,
-                    json_err
-                );
-                None
-            }
-        },
-    };
-
-    #[cfg(not(feature = "zstd"))]
-    let result: Option<PluginState> = match serde_json::from_slice(state) {
-        Ok(s) => Some(s),
-        Err(err) => {
-            crate::nice_debug_assert_failure!("Error while deserializing state: {}", err);
+/// Decode bounded CLAP state without modifying any plugin parameters.
+pub(crate) fn deserialize_json_bounded(state: &[u8], limit: usize) -> Option<PluginState> {
+    match decode_json(state, limit) {
+        Ok(state) => Some(state),
+        Err(error) => {
+            crate::nice_warn!("Error while deserializing plugin state: {error}");
             None
         }
-    };
-
-    result
+    }
 }
+
+fn decode_json(state: &[u8], limit: usize) -> Result<PluginState> {
+    ensure!(state.len() <= limit, "Stored state exceeds the size limit");
+
+    #[cfg(feature = "zstd")]
+    if let Ok(decoder) = zstd::stream::read::Decoder::with_buffer(state)
+        && let Ok(decoded) = serde_json::from_reader(std::io::BufReader::new(decoder))
+    {
+        // The CLAP limit is on stored bytes. Stream the decoded JSON into the state object,
+        // since legacy compressed records can expand past that limit.
+        return Ok(decoded);
+    }
+
+    // Plain JSON remains readable after compression is enabled.
+    serde_json::from_slice(state).context("Invalid plugin state JSON")
+}
+
+#[cfg(test)]
+mod tests;

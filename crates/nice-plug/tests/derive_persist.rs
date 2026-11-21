@@ -111,7 +111,7 @@ mod persist {
             assert_eq!(serialized.len(), 3);
             assert_eq!(serialized["bar_1"], "baz");
             assert_eq!(serialized["bar_2"], "baz");
-            assert_eq!(serialized["bar_2"], "baz");
+            assert_eq!(serialized["bar_3"], "baz");
         }
 
         #[test]

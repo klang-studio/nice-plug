@@ -1,7 +1,6 @@
 use clap_sys::stream::{clap_istream, clap_ostream};
 use std::mem::MaybeUninit;
 use std::ops::Deref;
-use std::os::raw::c_void;
 
 /// Early exit out of a function with the specified return value when one of the passed pointers is
 /// null.
@@ -120,56 +119,263 @@ unsafe impl ByteReadBuffer for &mut [MaybeUninit<u8>] {
     }
 }
 
-/// Read from a stream until either the byte slice as been filled, or the stream doesn't contain any
-/// data anymore. This correctly handles streams that only allow smaller, buffered reads.
-///
-/// Returns the total number of bytes that have been read, or `None` if an error occured.
-pub fn read_stream(stream: &clap_istream, mut slice: impl ByteReadBuffer) -> Option<usize> {
-    let mut total_bytes_read: usize = 0;
-
-    while total_bytes_read < slice.len() {
-        let bytes_read = unsafe_clap_call! {
-            stream=>read(
+/// Fill a slice using the host's potentially short reads.
+fn read_stream(stream: &clap_istream, mut slice: impl ByteReadBuffer) -> bool {
+    let Some(read) = stream.read else {
+        return false;
+    };
+    let mut offset = 0;
+    while offset < slice.len() {
+        let remaining = slice.len() - offset;
+        // SAFETY: The slice has `remaining` bytes available after `offset`.
+        let count = unsafe {
+            read(
                 stream,
-                slice.as_mut_ptr().add(total_bytes_read) as *mut c_void,
-                (slice.len() - total_bytes_read) as u64,
+                slice.as_mut_ptr().add(offset).cast(),
+                remaining as u64,
             )
         };
-
-        let Ok(bytes_read) = usize::try_from(bytes_read) else {
-            return None;
+        let Ok(count) = usize::try_from(count) else {
+            return false;
         };
-
-        if bytes_read == 0 {
-            break;
-        }
-
-        let total_bytes = total_bytes_read.checked_add(bytes_read)?;
-        total_bytes_read = total_bytes;
-    }
-
-    Some(total_bytes_read)
-}
-
-/// Write the data from a slice to a stream until either all data has been written, or the stream
-/// returns an error. This correctly handles streams that only allow smaller, buffered writes. This
-/// returns `false` if the stream returns an error or doesn't allow any writes anymore.
-pub fn write_stream(stream: &clap_ostream, slice: &[u8]) -> bool {
-    let mut write_pos = 0;
-    while write_pos < slice.len() {
-        let bytes_written = unsafe_clap_call! {
-            stream=>write(
-                stream,
-                slice.as_ptr().add(write_pos) as *const c_void,
-                (slice.len() - write_pos) as u64,
-            )
-        };
-        if bytes_written <= 0 {
+        if count == 0 || count > remaining {
             return false;
         }
+        offset += count;
+    }
+    true
+}
 
-        write_pos += bytes_written as usize;
+/// Write a slice using the host's potentially short writes.
+fn write_stream(stream: &clap_ostream, mut slice: &[u8]) -> bool {
+    let Some(write) = stream.write else {
+        return false;
+    };
+    while !slice.is_empty() {
+        // SAFETY: The input points to all `slice.len()` bytes for this call.
+        let count = unsafe { write(stream, slice.as_ptr().cast(), slice.len() as u64) };
+        let Ok(count) = usize::try_from(count) else {
+            return false;
+        };
+        if count == 0 || count > slice.len() {
+            return false;
+        }
+        slice = &slice[count..];
+    }
+    true
+}
+
+/// Read one little-endian length-prefixed CLAP state record.
+pub(super) fn read_state_record(
+    stream: &clap_istream,
+    limit: usize,
+) -> Result<Vec<u8>, &'static str> {
+    let mut length = [0_u8; 8];
+    if !read_stream(stream, length.as_mut_slice()) {
+        return Err("could not read the state length");
+    }
+    let length = usize::try_from(u64::from_le_bytes(length)).map_err(|_| "invalid state length")?;
+    if length > limit {
+        return Err("state length exceeds the limit");
     }
 
-    true
+    let mut payload = Vec::new();
+    payload
+        .try_reserve_exact(length)
+        .map_err(|_| "could not allocate the state buffer")?;
+    if !read_stream(stream, &mut payload.spare_capacity_mut()[..length]) {
+        return Err("could not read the complete state payload");
+    }
+    // SAFETY: The stream initialized all `length` bytes of the reserved capacity above.
+    unsafe { payload.set_len(length) };
+    Ok(payload)
+}
+
+/// Write one little-endian length-prefixed CLAP state record.
+pub(super) fn write_state_record(
+    stream: &clap_ostream,
+    payload: &[u8],
+    limit: usize,
+) -> Result<(), &'static str> {
+    if payload.len() > limit {
+        return Err("state length exceeds the limit");
+    }
+    if !write_stream(stream, &(payload.len() as u64).to_le_bytes()) {
+        return Err("could not write the state length");
+    }
+    if !write_stream(stream, payload) {
+        return Err("could not write the complete state payload");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cmp;
+    use std::ffi::c_void;
+    use std::ptr;
+
+    use super::*;
+
+    struct ReadState<'a> {
+        input: &'a [u8],
+        max_chunk: u64,
+        invalid_result: Option<i64>,
+    }
+
+    unsafe extern "C" fn read(stream: *const clap_istream, out: *mut c_void, len: u64) -> i64 {
+        // SAFETY: Our test stream holds this live context.
+        let context = unsafe { &mut *((*stream).ctx.cast::<ReadState<'_>>()) };
+        if let Some(result) = context.invalid_result {
+            return result;
+        }
+        let count = cmp::min(
+            cmp::min(len, context.max_chunk) as usize,
+            context.input.len(),
+        );
+        // SAFETY: This host callback writes only the bytes requested by the wrapper.
+        unsafe { ptr::copy_nonoverlapping(context.input.as_ptr(), out.cast(), count) };
+        context.input = &context.input[count..];
+        count as i64
+    }
+
+    impl ReadState<'_> {
+        fn stream(&mut self) -> clap_istream {
+            clap_istream {
+                ctx: ptr::from_mut(self).cast(),
+                read: Some(read),
+            }
+        }
+    }
+
+    struct WriteState {
+        output: Vec<u8>,
+        max_chunk: u64,
+        failure: Option<(usize, i64)>,
+    }
+
+    unsafe extern "C" fn write(stream: *const clap_ostream, input: *const c_void, len: u64) -> i64 {
+        // SAFETY: Our test stream holds this live context.
+        let context = unsafe { &mut *((*stream).ctx.cast::<WriteState>()) };
+        if let Some((after, result)) = context.failure
+            && context.output.len() >= after
+        {
+            return result;
+        }
+        let count = cmp::min(len, context.max_chunk) as usize;
+        // SAFETY: The wrapper flagged these bytes as readable and the test consumes only a prefix.
+        let input = unsafe { std::slice::from_raw_parts(input.cast(), count) };
+        context.output.extend_from_slice(input);
+        count as i64
+    }
+
+    impl WriteState {
+        fn stream(&mut self) -> clap_ostream {
+            clap_ostream {
+                ctx: ptr::from_mut(self).cast(),
+                write: Some(write),
+            }
+        }
+    }
+
+    #[test]
+    fn state_records_allow_short_transfers_and_leave_following_bytes_unread() {
+        let payload = br#"{"params":{},"fields":{}}"#;
+        let mut writer = WriteState {
+            output: Vec::new(),
+            max_chunk: 2,
+            failure: None,
+        };
+        write_state_record(&writer.stream(), payload, payload.len()).unwrap();
+        assert_eq!(&writer.output[..8], &(payload.len() as u64).to_le_bytes());
+        assert_eq!(&writer.output[8..], payload);
+        writer.output.extend_from_slice(b"next record");
+
+        let mut reader = ReadState {
+            input: &writer.output,
+            max_chunk: 3,
+            invalid_result: None,
+        };
+        assert_eq!(
+            read_state_record(&reader.stream(), payload.len()),
+            Ok(payload.to_vec())
+        );
+        assert_eq!(reader.input, b"next record");
+    }
+
+    #[test]
+    fn a_valid_json_prefix_is_not_a_complete_record() {
+        let payload = br#"{"params":{},"fields":{}}"#;
+        let limit = payload.len() + 1;
+        let mut frame = (limit as u64).to_le_bytes().to_vec();
+        frame.extend_from_slice(payload);
+        let mut reader = ReadState {
+            input: &frame,
+            max_chunk: 2,
+            invalid_result: None,
+        };
+        assert!(read_state_record(&reader.stream(), limit).is_err());
+        let mut reader = ReadState {
+            input: &frame[..7],
+            max_chunk: 2,
+            invalid_result: None,
+        };
+        assert!(read_state_record(&reader.stream(), limit).is_err());
+    }
+
+    #[test]
+    fn oversized_records_never_read_or_write_the_body_or_emit_a_header() {
+        let mut frame = 2_u64.to_le_bytes().to_vec();
+        frame.extend_from_slice(b"ab");
+        let mut reader = ReadState {
+            input: &frame,
+            max_chunk: 2,
+            invalid_result: None,
+        };
+        assert!(read_state_record(&reader.stream(), 1).is_err());
+        assert_eq!(reader.input, b"ab");
+
+        let mut writer = WriteState {
+            output: Vec::new(),
+            max_chunk: 2,
+            failure: None,
+        };
+        assert!(write_state_record(&writer.stream(), b"ab", 1).is_err());
+        assert!(writer.output.is_empty());
+    }
+
+    #[test]
+    fn stream_errors_and_overreported_progress_fail() {
+        for result in [-1, 0, 9, i64::MAX] {
+            let mut reader = ReadState {
+                input: b"",
+                max_chunk: 2,
+                invalid_result: Some(result),
+            };
+            assert!(read_state_record(&reader.stream(), 64).is_err());
+
+            let mut writer = WriteState {
+                output: Vec::new(),
+                max_chunk: 2,
+                failure: Some((0, result)),
+            };
+            assert!(write_state_record(&writer.stream(), b"ab", 64).is_err());
+            assert!(writer.output.is_empty());
+        }
+    }
+    #[test]
+    fn partial_state_payload_write_reports_failure() {
+        let payload = b"abcdef";
+        let mut writer = WriteState {
+            output: Vec::new(),
+            max_chunk: 2,
+            failure: Some((10, -1)),
+        };
+        assert_eq!(
+            write_state_record(&writer.stream(), payload, payload.len()),
+            Err("could not write the complete state payload"),
+        );
+        assert_eq!(&writer.output[..8], &(payload.len() as u64).to_le_bytes());
+        assert_eq!(&writer.output[8..], b"ab");
+    }
 }

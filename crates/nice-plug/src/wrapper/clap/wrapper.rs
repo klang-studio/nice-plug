@@ -29,10 +29,10 @@ use clap_sys::ext::note_ports::{
     clap_plugin_note_ports,
 };
 use clap_sys::ext::params::{
-    CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_BYPASS, CLAP_PARAM_IS_HIDDEN,
-    CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID, CLAP_PARAM_IS_READONLY,
-    CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info,
-    clap_plugin_params,
+    CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_BYPASS, CLAP_PARAM_IS_ENUM,
+    CLAP_PARAM_IS_HIDDEN, CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID,
+    CLAP_PARAM_IS_READONLY, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params,
+    clap_param_info, clap_plugin_params,
 };
 use clap_sys::ext::remote_controls::{
     CLAP_EXT_REMOTE_CONTROLS, clap_plugin_remote_controls, clap_remote_controls_page,
@@ -64,7 +64,6 @@ use clap_sys::process::{
 };
 use clap_sys::stream::{clap_istream, clap_ostream};
 use crossbeam::atomic::AtomicCell;
-use crossbeam::channel::{self, SendTimeoutError};
 use crossbeam::queue::ArrayQueue;
 use nice_plug_core::audio_setup::{AudioIOLayout, AuxiliaryBuffers, BufferConfig, ProcessMode};
 #[cfg(feature = "editor")]
@@ -80,6 +79,8 @@ use nice_plug_core::plugin::{Plugin, PluginState, ProcessStatus, TaskExecutor};
 use nice_plug_core::plugin::{TrackColor, TrackInfo};
 use parking_lot::Mutex;
 #[cfg(feature = "editor")]
+use parking_lot::RwLock;
+#[cfg(feature = "editor")]
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, c_void};
@@ -87,22 +88,22 @@ use std::mem;
 use std::num::NonZeroU32;
 use std::os::raw::c_char;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
-use try_lock::TryLock;
+use try_lock::{Locked, TryLock};
 
 use super::context::{WrapperActivateContext, WrapperProcessContext};
 use super::descriptor::PluginDescriptor;
 use super::util::ClapPtr;
 use crate::event_loop::{BackgroundThread, EventLoop, MainThreadExecutor, TASK_QUEUE_CAPACITY};
 use crate::util::permit_alloc;
-use crate::wrapper::clap::ClapPlugin;
 use crate::wrapper::clap::context::RemoteControlPages;
 #[cfg(feature = "editor")]
 use crate::wrapper::clap::context::WrapperGuiContext;
-use crate::wrapper::clap::util::{read_stream, write_stream};
+use crate::wrapper::clap::util::{read_state_record, write_state_record};
+use crate::wrapper::clap::{ClapPlugin, LibraryWorkers};
 use crate::wrapper::state::{self};
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 use crate::wrapper::util::{clamp_input_event_timing, hash_param_id, process_wrapper, strlcpy};
@@ -110,12 +111,211 @@ use crate::wrapper::util::{clamp_input_event_timing, hash_param_id, process_wrap
 /// How many output parameter changes we can store in our output parameter change queue. Storing
 /// more than this many parameters at a time will cause changes to get lost.
 const OUTPUT_EVENT_QUEUE_CAPACITY: usize = 2048;
+const DEFERRED_EVENT_QUEUE_CAPACITY: usize = 256;
+
+#[derive(Clone, Copy)]
+struct QueuedOutputEvent {
+    event: OutputParamEvent,
+    revision: u64,
+}
+
+#[derive(Clone, Copy)]
+struct DeferredParameter {
+    param_id: u32,
+    note_id: i32,
+    value: f64,
+    event_type: u16,
+    revision: u64,
+}
+
+impl DeferredParameter {
+    /// If non-null, the pointer must be valid for the original host event's advertised size.
+    unsafe fn from_event(event: *const clap_event_header, revision: u64) -> Option<Self> {
+        let header = unsafe { event.as_ref() }?;
+        if header.space_id != CLAP_CORE_EVENT_SPACE_ID {
+            return None;
+        }
+        let size = header.size as usize;
+        let (param_id, note_id, value) = match header.type_ {
+            CLAP_EVENT_PARAM_VALUE if size >= mem::size_of::<clap_event_param_value>() => {
+                let event = unsafe { &*event.cast::<clap_event_param_value>() };
+                (event.param_id, event.note_id, event.value)
+            }
+            CLAP_EVENT_PARAM_MOD if size >= mem::size_of::<clap_event_param_mod>() => {
+                let event = unsafe { &*event.cast::<clap_event_param_mod>() };
+                (event.param_id, event.note_id, event.amount)
+            }
+            _ => return None,
+        };
+        Some(Self {
+            param_id,
+            note_id,
+            value,
+            event_type: header.type_,
+            revision,
+        })
+    }
+}
+
+/// A restore supersedes host values from before its request and plugin output queued
+/// before it completed. Each cutoff applies only to parameters that the restore changed.
+#[derive(Default)]
+struct RestoredParameterRevisions {
+    incoming: AtomicU64,
+    outgoing: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+enum DeferredVoiceEvent {
+    NoteRelease(clap_event_note),
+    MidiRelease(clap_event_midi),
+    Modulation(DeferredParameter),
+}
 
 /// Protect against OOM issues when loading malformed state.
 ///
 /// If your plugin needs more storgage space than this, please post an issue in the nice-plug
 /// repository.
-const MAX_STATE_BYTES: u64 = 268_435_456;
+const MAX_STATE_BYTES: usize = 268_435_456;
+
+const STATE_ACCESS_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The audio side takes only nonblocking atomic guards. A control-thread request first reserves
+/// access so continuous blocks cannot starve the state update.
+#[derive(Default)]
+struct StateAccess {
+    gate: TryLock<()>,
+    control_pending: AtomicBool,
+}
+
+impl StateAccess {
+    fn try_audio(&self) -> Option<Locked<'_, ()>> {
+        if self.control_pending.load(Ordering::Acquire) {
+            return None;
+        }
+        let guard = self.gate.try_lock()?;
+        (!self.control_pending.load(Ordering::Acquire)).then_some(guard)
+    }
+
+    /// A bounded control request fails if another control operation has already reserved access.
+    /// Editor restores pass no timeout so the value is available when the GUI call returns.
+    fn with_control<T>(&self, timeout: Option<Duration>, apply: impl FnOnce() -> T) -> Option<T> {
+        const POLL_INTERVAL: Duration = Duration::from_millis(1);
+        let _request = loop {
+            if self
+                .control_pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break StateRequest(&self.control_pending);
+            }
+            if timeout.is_some() {
+                return None;
+            }
+            thread::sleep(POLL_INTERVAL);
+        };
+        let started = Instant::now();
+        loop {
+            if let Some(_gate) = self.gate.try_lock() {
+                return Some(apply());
+            }
+
+            if let Some(timeout) = timeout {
+                let remaining = timeout.checked_sub(started.elapsed())?;
+                thread::sleep(remaining.min(POLL_INTERVAL));
+                if started.elapsed() >= timeout {
+                    return None;
+                }
+            } else {
+                thread::sleep(POLL_INTERVAL);
+            }
+        }
+    }
+}
+
+struct StateRequest<'a>(&'a AtomicBool);
+
+impl Drop for StateRequest<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Silence the configured output channels when a state change excludes the audio callback.
+/// # Safety
+/// Non-null audio buffers and their channel pointers must be valid for the current process call.
+unsafe fn silence_audio_outputs(process: &clap_process, layout: AudioIOLayout) {
+    if process.audio_outputs.is_null() {
+        return;
+    }
+    let configured_ports = layout
+        .main_output_channels
+        .into_iter()
+        .chain(layout.aux_output_ports.iter().copied());
+    for (index, channels) in configured_ports
+        .take(process.audio_outputs_count as usize)
+        .enumerate()
+    {
+        // SAFETY: This index is below the output port count advertised by the host.
+        let buffer = unsafe { &mut *process.audio_outputs.add(index) };
+        let channel_count = channels.get().min(buffer.channel_count) as usize;
+        let frames = process.frames_count as usize;
+        // SAFETY: The channel count and frame count are bounded by the host's process buffers.
+        unsafe {
+            if !buffer.data32.is_null() {
+                clear_channels(buffer.data32, channel_count, frames);
+            }
+            if !buffer.data64.is_null() {
+                clear_channels(buffer.data64, channel_count, frames);
+            }
+        }
+        buffer.constant_mask = 0;
+    }
+}
+
+/// The host gives exclusive access to non-null f32/f64 sample buffers during processing.
+unsafe fn clear_channels<T>(channels: *mut *mut T, count: usize, frames: usize) {
+    for channel in 0..count {
+        // SAFETY: Each host-owned channel pointer is valid for `frames` samples, if non-null.
+        unsafe {
+            let samples = *channels.add(channel);
+            if !samples.is_null() {
+                samples.write_bytes(0, frames);
+            }
+        }
+    }
+}
+
+fn advance_transport_bar(
+    transport: &mut Transport,
+    context: &clap_event_transport,
+    elapsed_samples: usize,
+) {
+    if context.flags & CLAP_TRANSPORT_HAS_BEATS_TIMELINE == 0 {
+        return;
+    }
+    let bar_start = context.bar_start as f64 / CLAP_BEATTIME_FACTOR as f64;
+    transport.bar_start_pos_beats = Some(bar_start);
+    transport.bar_number = Some(context.bar_number);
+    // Past time signature changes can shift the grid away from beat zero.
+    if transport.playing
+        && elapsed_samples > 0
+        && let (Some(beats), Some(numerator), Some(denominator)) = (
+            transport.pos_beats,
+            transport.time_sig_numerator,
+            transport.time_sig_denominator,
+        )
+        && numerator > 0
+        && denominator > 0
+    {
+        let bar_length = f64::from(numerator) * 4.0 / f64::from(denominator);
+        let bars_elapsed = ((beats - bar_start) / bar_length).floor();
+        if bars_elapsed.is_finite() && bars_elapsed > 0.0 {
+            transport.bar_start_pos_beats = Some(bar_start + bars_elapsed * bar_length);
+            transport.bar_number = Some((f64::from(context.bar_number) + bars_elapsed) as i32);
+        }
+    }
+}
 
 pub struct Wrapper<P: ClapPlugin> {
     /// A reference to this object, upgraded to an `Arc<Self>` for the GUI context.
@@ -124,7 +324,7 @@ pub struct Wrapper<P: ClapPlugin> {
     /// The wrapped plugin instance.
     plugin: TryLock<P>,
     /// The plugin's background task executor closure.
-    pub task_executor: Mutex<TaskExecutor<P>>,
+    task_executor: Arc<BackgroundTaskExecutor<P>>,
     /// The plugin's parameters. These are fetched once during initialization. That way the
     /// `ParamPtr`s are guaranteed to live at least as long as this object and we can interact with
     /// the `Params` object without having to acquire a lock on `plugin`.
@@ -147,7 +347,6 @@ pub struct Wrapper<P: ClapPlugin> {
     #[cfg(feature = "editor")]
     fallback_scale_factor: AtomicCell<Option<f64>>,
     is_activated: AtomicBool,
-    is_processing: AtomicBool,
     /// The current IO configuration, modified through the `clap_plugin_audio_ports_config`
     /// extension. Initialized to the plugin's first audio IO configuration.
     current_audio_io_layout: AtomicCell<AudioIOLayout>,
@@ -164,28 +363,22 @@ pub struct Wrapper<P: ClapPlugin> {
     input_events: AtomicRefCell<VecDeque<PluginNoteEvent<P>>>,
     /// The last process status returned by the plugin. This is used for tail handling.
     last_process_status: AtomicCell<ProcessStatus>,
-    /// Whether the latency has changed since the last call to `activate`. When this is set,
-    /// `latency_changed` needs to be called in `activate` in order to inform the host of the
-    /// latency change.
-    latency_changed: AtomicBool,
-    /// The current latency in samples, as set by the plugin through the
-    /// [`ProcessContext`](nice_plug_core::context::process::ProcessContext). Uses the latency
-    /// extension.
-    pub current_latency: AtomicU32,
+    /// Guard against requesting multiple restarts for a pending latency change.
+    latency_restart_requested: AtomicBool,
+    /// Latency requested by the DSP, committed by the next successful activation.
+    pending_latency: AtomicU32,
+    /// Latency reported to the host, constant throughout an activation.
+    current_latency: AtomicU32,
     /// A data structure that helps manage and create buffers for all of the plugin's inputs and
     /// outputs based on channel pointers provided by the host.
     buffer_manager: AtomicRefCell<BufferManager>,
-    /// The plugin is able to restore state through a method on the `GuiContext`. To avoid changing
-    /// parameters mid-processing and running into garbled data if the host also tries to load state
-    /// at the same time the restoring happens at the end of each processing call. If this zero
-    /// capacity channel contains state data at that point, then the audio thread will take the
-    /// state out of the channel, restore the state, and then send it back through the same channel.
-    /// In other words, the GUI thread acts as a sender and then as a receiver, while the audio
-    /// thread acts as a receiver and then as a sender. That way deallocation can happen on the GUI
-    /// thread. All of this happens without any blocking on the audio thread.
-    updated_state_sender: channel::Sender<PluginState>,
-    /// The receiver belonging to [`new_state_sender`][Self::new_state_sender].
-    updated_state_receiver: channel::Receiver<PluginState>,
+    /// Coordinates off-audio state changes with process and parameter flush.
+    state_access: StateAccess,
+    deferred_parameters: ArrayQueue<DeferredParameter>,
+    deferred_voice_events: ArrayQueue<DeferredVoiceEvent>,
+    reconcile_voices: AtomicBool,
+    revision: AtomicU64,
+    restored_parameter_revisions: HashMap<u32, RestoredParameterRevisions>,
 
     // We'll query all of the host's extensions upfront
     host_callback: ClapPtr<clap_host>,
@@ -225,6 +418,8 @@ pub struct Wrapper<P: ClapPlugin> {
     /// Mappings from parameter hashes to string parameter IDs. Used for notifying the plugin's
     /// editor about parameter changes.
     param_id_by_hash: HashMap<u32, String>,
+    /// Typed enum parameters whose complete CLAP value text is nonblank.
+    enum_param_hashes: HashSet<u32>,
     /// The group name of a parameter, indexed by the parameter's hash. Nested groups are delimited
     /// by slashes, and they're only used to allow the DAW to display parameters in a tree
     /// structure.
@@ -247,7 +442,15 @@ pub struct Wrapper<P: ClapPlugin> {
     /// XXX: There's no guarantee that a single parameter doesn't occur twice in this queue, but
     ///      even if it does then that should still not be a problem because the host also reads it
     ///      in the same order, right?
-    output_parameter_events: ArrayQueue<OutputParamEvent>,
+    output_parameter_events: ArrayQueue<QueuedOutputEvent>,
+    /// The first rejected event stays in front of the producer queue. Only process and flush
+    /// consume this slot, and CLAP forbids calling them concurrently.
+    rejected_parameter_event: AtomicRefCell<Option<QueuedOutputEvent>>,
+    /// Coalesces output retry requests for the host's main thread.
+    parameter_retry_requested: AtomicBool,
+    /// Accepted parameter values are published to the host before a slice and applied to DSP
+    /// after it. This storage is preallocated for the largest possible drain.
+    accepted_output_parameter_values: AtomicRefCell<Vec<(u32, f64)>>,
 
     host_thread_check: AtomicRefCell<Option<ClapPtr<clap_host_thread_check>>>,
 
@@ -288,9 +491,20 @@ pub struct Wrapper<P: ClapPlugin> {
     /// [`host_thread_check`][Self::host_thread_check] thus contains a value), then that extension
     /// is used instead.
     main_thread_id: ThreadId,
-    /// A background thread for running tasks independently from the host'main GUI thread. Useful
-    /// for longer, blocking tasks. Initialized later as it needs a reference to the wrapper.
-    background_thread: AtomicRefCell<Option<BackgroundThread<Task<P>, Self>>>,
+    /// The worker owns the task executor independently of the host-facing wrapper.
+    background_thread: BackgroundThread<P::BackgroundTask, BackgroundTaskExecutor<P>>,
+    /// Guards editor task submission across instance teardown. Background tasks may hold a clone
+    /// of the async executor, but only submission holds this guard.
+    #[cfg(feature = "editor")]
+    editor_tasks_open: Arc<RwLock<bool>>,
+}
+
+struct BackgroundTaskExecutor<P: Plugin>(Mutex<TaskExecutor<P>>);
+
+impl<P: Plugin> MainThreadExecutor<P::BackgroundTask> for BackgroundTaskExecutor<P> {
+    fn execute(&self, task: P::BackgroundTask, _: bool) {
+        (self.0.lock())(task);
+    }
 }
 
 /// Tasks that can be sent from the plugin to be executed on the main thread in a non-blocking
@@ -309,12 +523,8 @@ pub enum Task<P: Plugin> {
     #[cfg(feature = "editor")]
     ParameterModulationChanged(u32, f32),
     StateChanged,
-    /// Inform the host that the latency has changed.
-    LatencyChanged,
     /// Inform the host that the voice info has changed.
     VoiceInfoChanged,
-    /// Tell the host that it should rescan the current parameter values.
-    RescanParamValues,
 }
 
 /// The types of CLAP parameter updates for events.
@@ -329,8 +539,8 @@ pub enum ClapParamUpdate {
 }
 
 /// A parameter event that should be output by the plugin, stored in a queue on the wrapper and
-/// written to the host either at the end of the process function or during a flush.
-#[derive(Debug, Clone)]
+/// written to the host at the start of a process slice or during a flush.
+#[derive(Debug, Clone, Copy)]
 pub enum OutputParamEvent {
     /// Begin an automation gesture. This must always be sent before sending [`SetValue`].
     BeginGesture { param_hash: u32 },
@@ -360,23 +570,15 @@ impl<P: ClapPlugin> EventLoop<Task<P>, Wrapper<P>> for Wrapper<P> {
             self.execute(task, true);
             true
         } else {
-            let success = self.tasks.push(task).is_ok();
-            if success {
-                // CLAP lets us use the host's event loop instead of having to implement our own
-                let host = &self.host_callback;
-                unsafe_clap_call! { host=>request_callback(&**host) };
-            }
-
-            success
+            self.enqueue_gui_task(task)
         }
     }
 
     fn schedule_background(&self, task: Task<P>) -> bool {
-        self.background_thread
-            .borrow()
-            .as_ref()
-            .unwrap()
-            .schedule(task)
+        let Task::PluginTask(task) = task else {
+            unreachable!("only plugin tasks run on the background worker");
+        };
+        self.background_thread.schedule(task)
     }
 
     fn is_main_thread(&self) -> bool {
@@ -397,7 +599,7 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
     fn execute(&self, task: Task<P>, is_gui_thread: bool) {
         // This function is always called from the main thread, from [Self::on_main_thread].
         match task {
-            Task::PluginTask(task) => (self.task_executor.lock())(task),
+            Task::PluginTask(task) => self.execute_plugin_task(task),
             #[cfg(feature = "editor")]
             Task::ParameterValueChanged(param_hash, normalized_value) => {
                 use nice_plug_core::editor::EditorHandle;
@@ -436,29 +638,6 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                         .param_modulation_changed(param_id, modulation_offset);
                 }
             }
-            Task::LatencyChanged => match &*self.host_latency.borrow() {
-                Some(host_latency) => {
-                    crate::nice_debug_assert!(is_gui_thread);
-
-                    // The plugin needs to be deactivated in order for the latency to change. If
-                    // it's already deactivated we can notify the host immediately, otherwise we
-                    // need to request a restart and remember to notify the host of the latency
-                    // change in the `activate` function.
-                    //
-                    // In practice, ignoring the activation status would be fine for many hosts, but
-                    // following the specification is probably a good idea regardless :)
-                    if self.is_activated.load(Ordering::SeqCst) {
-                        self.latency_changed.store(true, Ordering::SeqCst);
-                        self.request_restart();
-                    } else {
-                        unsafe_clap_call! { host_latency=>changed(&*self.host_callback) };
-                    }
-                }
-                None => {
-                    #[cfg(debug_assertions)]
-                    crate::nice_warn!("Host does not support the latency extension");
-                }
-            },
             Task::VoiceInfoChanged => match &*self.host_voice_info.borrow() {
                 Some(host_voice_info) => {
                     crate::nice_debug_assert!(is_gui_thread);
@@ -469,31 +648,19 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                     crate::nice_warn!("Host does not support the voice-info extension");
                 }
             },
-            Task::RescanParamValues => match &*self.host_params.borrow() {
-                Some(host_params) => {
-                    crate::nice_debug_assert!(is_gui_thread);
-                    unsafe_clap_call! { host_params=>rescan(&*self.host_callback, CLAP_PARAM_RESCAN_VALUES) };
-                }
-                None => {
-                    #[cfg(debug_assertions)]
-                    crate::nice_warn!("Host does not support the parameter extension");
-                }
-            },
         };
     }
 }
 
 impl<P: ClapPlugin> Wrapper<P> {
+    /// Creates a CLAP instance with a unique parameter inventory.
+    ///
     /// # Safety
     ///
     /// `host_callback` needs to outlive the returned object.
-    pub unsafe fn new(host_callback: *const clap_host) -> Arc<Self> {
+    pub unsafe fn new(host_callback: *const clap_host) -> Option<Arc<Self>> {
         let mut plugin = P::default();
-        let task_executor = Mutex::new(plugin.task_executor());
-
-        // This is used to allow the plugin to restore preset data from its editor, see the comment
-        // on `Self::updated_state_sender`
-        let (updated_state_sender, updated_state_receiver) = channel::bounded(0);
+        let task_executor = Arc::new(BackgroundTaskExecutor(Mutex::new(plugin.task_executor())));
 
         let plugin_descriptor: Box<PluginDescriptor> =
             Box::new(PluginDescriptor::for_plugin::<P>());
@@ -517,11 +684,28 @@ impl<P: ClapPlugin> Wrapper<P> {
                 (id, hash, ptr, group)
             })
             .collect();
+        let mut seen_hashes = HashSet::new();
+        for (id, hash, _, _) in &param_id_hashes_ptrs_groups {
+            // Duplicate author IDs also have identical hashes. Check before creating any
+            // lookup maps, as an insertion would silently replace the earlier parameter.
+            if !seen_hashes.insert(*hash) {
+                crate::nice_error!("Duplicate or colliding CLAP parameter ID: {:?}", id);
+                return None;
+            }
+        }
+        let enum_param_hashes = param_id_hashes_ptrs_groups
+            .iter()
+            .filter_map(|(_, hash, param, _)| {
+                // The Params Arc keeps the parameter alive for the lifetime of this wrapper.
+                let valid = unsafe { has_enum_value_text(*param) };
+                valid.then_some(*hash)
+            })
+            .collect();
         let param_hashes = param_id_hashes_ptrs_groups
             .iter()
             .map(|(_, hash, _, _)| *hash)
             .collect();
-        let param_by_hash = param_id_hashes_ptrs_groups
+        let param_by_hash: HashMap<_, _> = param_id_hashes_ptrs_groups
             .iter()
             .map(|(_, hash, ptr, _)| (*hash, *ptr))
             .collect();
@@ -549,18 +733,6 @@ impl<P: ClapPlugin> Wrapper<P> {
             .collect();
 
         if cfg!(debug_assertions) {
-            let param_map = params.param_map();
-            let param_ids: HashSet<_> = param_id_hashes_ptrs_groups
-                .iter()
-                .map(|(id, _, _, _)| id.clone())
-                .collect();
-            crate::nice_debug_assert_eq!(
-                param_map.len(),
-                param_ids.len(),
-                "The plugin has duplicate parameter IDs, weird things may happen. Consider using \
-                 6 character parameter IDs to avoid collisions."
-            );
-
             let poly_mod_ids: HashSet<u32> = poly_mod_ids_by_hash.values().copied().collect();
             crate::nice_debug_assert_eq!(
                 poly_mod_ids_by_hash.len(),
@@ -592,6 +764,8 @@ impl<P: ClapPlugin> Wrapper<P> {
             &param_ptr_to_hash,
         );
 
+        let background_thread = BackgroundThread::get_or_create(Arc::downgrade(&task_executor));
+
         let wrapper = Self {
             this: AtomicRefCell::new(Weak::new()),
 
@@ -607,15 +781,17 @@ impl<P: ClapPlugin> Wrapper<P> {
             fallback_scale_factor: AtomicCell::new(None),
 
             is_activated: AtomicBool::new(false),
-            is_processing: AtomicBool::new(false),
             current_audio_io_layout: AtomicCell::new(
                 P::AUDIO_IO_LAYOUTS.first().copied().unwrap_or_default(),
             ),
             current_buffer_config: AtomicCell::new(None),
             current_process_mode: AtomicCell::new(ProcessMode::Realtime),
-            input_events: AtomicRefCell::new(VecDeque::with_capacity(P::INPUT_EVENT_CAPACITY)),
+            input_events: AtomicRefCell::new(VecDeque::with_capacity(
+                P::INPUT_EVENT_CAPACITY.saturating_add(2 * DEFERRED_EVENT_QUEUE_CAPACITY),
+            )),
             last_process_status: AtomicCell::new(ProcessStatus::Normal),
-            latency_changed: AtomicBool::new(false),
+            latency_restart_requested: AtomicBool::new(false),
+            pending_latency: AtomicU32::new(0),
             current_latency: AtomicU32::new(0),
             // This is initialized just before calling `Plugin::activate()` so that during the
             // process call buffers can be initialized without any allocations
@@ -623,8 +799,15 @@ impl<P: ClapPlugin> Wrapper<P> {
                 0,
                 AudioIOLayout::default(),
             )),
-            updated_state_sender,
-            updated_state_receiver,
+            state_access: StateAccess::default(),
+            deferred_parameters: ArrayQueue::new(DEFERRED_EVENT_QUEUE_CAPACITY),
+            deferred_voice_events: ArrayQueue::new(DEFERRED_EVENT_QUEUE_CAPACITY),
+            reconcile_voices: AtomicBool::new(false),
+            revision: AtomicU64::new(1),
+            restored_parameter_revisions: param_by_hash
+                .keys()
+                .map(|hash| (*hash, RestoredParameterRevisions::default()))
+                .collect(),
 
             host_callback,
 
@@ -703,11 +886,17 @@ impl<P: ClapPlugin> Wrapper<P> {
             param_hashes,
             param_by_hash,
             param_id_by_hash,
+            enum_param_hashes,
             param_group_by_hash,
             param_id_to_hash,
             param_ptr_to_hash,
             poly_mod_ids_by_hash,
             output_parameter_events: ArrayQueue::new(OUTPUT_EVENT_QUEUE_CAPACITY),
+            rejected_parameter_event: AtomicRefCell::new(None),
+            parameter_retry_requested: AtomicBool::new(false),
+            accepted_output_parameter_values: AtomicRefCell::new(Vec::with_capacity(
+                OUTPUT_EVENT_QUEUE_CAPACITY + 1,
+            )),
 
             host_thread_check: AtomicRefCell::new(None),
 
@@ -758,8 +947,9 @@ impl<P: ClapPlugin> Wrapper<P> {
 
             tasks: ArrayQueue::new(TASK_QUEUE_CAPACITY),
             main_thread_id: thread::current().id(),
-            // Initialized later as it needs a reference to the wrapper for the executor
-            background_thread: AtomicRefCell::new(None),
+            background_thread,
+            #[cfg(feature = "editor")]
+            editor_tasks_open: Arc::new(RwLock::new(true)),
         };
 
         // Finally, the wrapper needs to contain a reference to itself so we can create GuiContexts
@@ -771,10 +961,6 @@ impl<P: ClapPlugin> Wrapper<P> {
         // from the vtable functions
         wrapper.clap_plugin.borrow_mut().plugin_data = Arc::as_ptr(&wrapper) as *mut _;
 
-        // Initialize the background thread **before** the editor!
-        *wrapper.background_thread.borrow_mut() =
-            Some(BackgroundThread::get_or_create(Arc::downgrade(&wrapper)));
-
         // The editor also needs to be initialized later so the Async executor can work.
         #[cfg(feature = "editor")]
         {
@@ -784,8 +970,15 @@ impl<P: ClapPlugin> Wrapper<P> {
                 .unwrap()
                 .editor(nice_plug_core::context::gui::AsyncExecutor::new(
                     Arc::new({
+                        let tasks_open = Arc::clone(&wrapper.editor_tasks_open);
                         let wrapper = Arc::downgrade(&wrapper);
                         move |task| {
+                            let Some(is_open) = tasks_open.try_read() else {
+                                return;
+                            };
+                            if !*is_open {
+                                return;
+                            }
                             let wrapper = match wrapper.upgrade() {
                                 Some(wrapper) => wrapper,
                                 None => return,
@@ -799,8 +992,15 @@ impl<P: ClapPlugin> Wrapper<P> {
                         }
                     }),
                     Arc::new({
+                        let tasks_open = Arc::clone(&wrapper.editor_tasks_open);
                         let wrapper = Arc::downgrade(&wrapper);
                         move |task| {
+                            let Some(is_open) = tasks_open.try_read() else {
+                                return;
+                            };
+                            if !*is_open {
+                                return;
+                            }
                             let wrapper = match wrapper.upgrade() {
                                 Some(wrapper) => wrapper,
                                 None => return,
@@ -817,7 +1017,16 @@ impl<P: ClapPlugin> Wrapper<P> {
                 .map(Mutex::new);
         }
 
-        wrapper
+        Some(wrapper)
+    }
+
+    #[doc(hidden)]
+    pub fn retain_background_worker(&self, workers: &LibraryWorkers) {
+        workers.retain(self.background_thread.worker_handle());
+    }
+
+    pub(super) fn execute_plugin_task(&self, task: P::BackgroundTask) {
+        self.task_executor.execute(task, false);
     }
 
     #[cfg(feature = "editor")]
@@ -829,10 +1038,7 @@ impl<P: ClapPlugin> Wrapper<P> {
         }))
     }
 
-    /// # Note
-    ///
-    /// The lock on the plugin must be dropped before this object is dropped to avoid deadlocks
-    /// caused by reentrant function calls.
+    /// The activation context collects latency requests for a successful activation.
     fn make_activate_context(&self) -> WrapperActivateContext<'_, P> {
         WrapperActivateContext {
             wrapper: self,
@@ -843,7 +1049,7 @@ impl<P: ClapPlugin> Wrapper<P> {
     fn make_process_context(
         &self,
         transport: Transport,
-        total_buffer_len: usize,
+        end_sample_idx: usize,
         current_sample_idx: usize,
         host_out_events: *const clap_output_events,
     ) -> WrapperProcessContext<'_, P> {
@@ -851,8 +1057,9 @@ impl<P: ClapPlugin> Wrapper<P> {
             wrapper: self,
             input_events_guard: self.input_events.borrow_mut(),
             transport,
-            total_buffer_len: total_buffer_len as u32,
+            end_sample_idx: end_sample_idx as u32,
             current_sample_idx: current_sample_idx as u32,
+            last_output_time: current_sample_idx as u32,
             host_out_events,
         }
     }
@@ -867,15 +1074,12 @@ impl<P: ClapPlugin> Wrapper<P> {
             .map(|s| s.as_str())
     }
 
-    /// Queue a parameter output event to be sent to the host at the end of the audio processing
-    /// cycle, and request a parameter flush from the host if the plugin is not currently processing
-    /// audio. The parameter's actual value will only be updated at that point so the value won't
-    /// change in the middle of a processing call.
+    /// Queue a parameter event to be sent at the start of a process slice or during a flush.
+    /// The DSP receives accepted values between slices, or during a flush.
     ///
-    /// Returns `false` if the parameter value queue was full and the update will not be sent to the
-    /// host (it will still be set on the plugin either way).
+    /// Returns `false` if the bounded producer queue is full.
     pub fn queue_parameter_event(&self, event: OutputParamEvent) -> bool {
-        let result = self.output_parameter_events.push(event).is_ok();
+        let result = self.push_output_event(event);
 
         // Requesting a flush is fine even during audio processing. This avoids a race condition.
         match &*self.host_params.borrow() {
@@ -888,6 +1092,42 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
 
         result
+    }
+
+    fn push_output_event(&self, event: OutputParamEvent) -> bool {
+        self.output_parameter_events
+            .push(QueuedOutputEvent {
+                event,
+                revision: self.next_revision(),
+            })
+            .is_ok()
+    }
+
+    fn next_revision(&self) -> u64 {
+        self.revision.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Queue a main-thread notification without invoking editor code on the calling stack.
+    fn enqueue_gui_task(&self, task: Task<P>) -> bool {
+        let queued = self.tasks.push(task).is_ok();
+        if queued {
+            self.request_main_callback();
+        }
+        queued
+    }
+
+    fn request_main_callback(&self) {
+        if let Some(request_callback) = self.host_callback.request_callback {
+            unsafe { request_callback(&*self.host_callback) };
+        }
+    }
+
+    fn request_parameter_retry(&self) {
+        // request_flush is forbidden on the audio thread. A host main-thread callback can
+        // rearm it even if no further process call is scheduled.
+        if !self.parameter_retry_requested.swap(true, Ordering::AcqRel) {
+            self.request_main_callback();
+        }
     }
 
     /// Convenience function for setting a value for a parameter as triggered by a CLAP parameter
@@ -921,12 +1161,11 @@ impl<P: ClapPlugin> Wrapper<P> {
 
                             #[cfg(feature = "editor")]
                             {
-                                // The GUI needs to be informed about the changed parameter value. This
-                                // triggers an `Editor::param_value_changed()` call on the GUI thread.
-                                let task_posted = self.schedule_gui(Task::ParameterValueChanged(
-                                    hash,
-                                    normalized_value,
-                                ));
+                                // Even an inactive flush can hold the state gate on the main
+                                // thread. Notify later so the editor can synchronously restore a preset.
+                                let task_posted = self.enqueue_gui_task(
+                                    Task::ParameterValueChanged(hash, normalized_value),
+                                );
                                 crate::nice_debug_assert!(
                                     task_posted,
                                     "The task queue is full, dropping task..."
@@ -951,7 +1190,7 @@ impl<P: ClapPlugin> Wrapper<P> {
 
                             #[cfg(feature = "editor")]
                             {
-                                let task_posted = self.schedule_gui(
+                                let task_posted = self.enqueue_gui_task(
                                     Task::ParameterModulationChanged(hash, normalized_delta),
                                 );
                                 crate::nice_debug_assert!(
@@ -969,37 +1208,36 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
     }
 
-    /// Handle all incoming events from an event queue. This will clear `self.input_events` first.
+    /// Apply flushed parameter changes. Only process can deliver per-note modulation to DSP.
     ///
     /// # Safety
     ///
-    /// `in_` must contain only pointers to valid data (Clippy insists on there being a safety
-    /// section here).
-    pub unsafe fn handle_in_events(
-        &self,
-        in_: &clap_input_events,
-        current_sample_idx: usize,
-        total_buffer_len: usize,
-    ) {
+    /// `in_` must contain only pointers to valid data.
+    unsafe fn handle_flush_events(&self, in_: Option<&clap_input_events>) {
         let mut input_events = self.input_events.borrow_mut();
         input_events.clear();
+        self.replay_parameters(&mut input_events, 0);
+        let Some(in_) = in_ else { return };
 
         unsafe {
             let num_events = clap_call! { in_=>size(in_) };
             for event_idx in 0..num_events {
                 let event = clap_call! { in_=>get(in_, event_idx) };
-                self.handle_input_event(
-                    event,
-                    &mut input_events,
-                    None,
-                    current_sample_idx,
-                    total_buffer_len,
-                );
+                let Some(header) = event.as_ref() else {
+                    continue;
+                };
+                if let Some(parameter) = DeferredParameter::from_event(header, 0)
+                    && self.is_per_note_modulation(parameter)
+                {
+                    self.defer_voice_modulation(parameter);
+                } else {
+                    self.handle_input_event(event, &mut input_events, None, 0, 0);
+                }
             }
         }
     }
 
-    /// Similar to [`handle_in_events()`][Self::handle_in_events()], but will stop just before an
+    /// Handle incoming events from the host, stopping just before an
     /// event if the predicate returns true for that events. This predicate is only called for
     /// events that occur after `current_sample_idx`. This is used to stop before a tempo or time
     /// signature change, or before next parameter change event with `raw_event.time >
@@ -1015,7 +1253,7 @@ impl<P: ClapPlugin> Wrapper<P> {
     /// section here).
     pub unsafe fn handle_in_events_until(
         &self,
-        in_: &clap_input_events,
+        in_: Option<&clap_input_events>,
         transport_info: &mut *const clap_event_transport,
         current_sample_idx: usize,
         total_buffer_len: usize,
@@ -1024,6 +1262,27 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) -> Option<(usize, usize)> {
         let mut input_events = self.input_events.borrow_mut();
         input_events.clear();
+        if current_sample_idx == 0 {
+            self.replay_parameters(&mut input_events, total_buffer_len);
+            for _ in 0..DEFERRED_EVENT_QUEUE_CAPACITY {
+                let Some(event) = self.deferred_voice_events.pop() else {
+                    break;
+                };
+                let header = match &event {
+                    DeferredVoiceEvent::NoteRelease(note) => &note.header,
+                    DeferredVoiceEvent::MidiRelease(midi) => &midi.header,
+                    DeferredVoiceEvent::Modulation(parameter) => {
+                        self.replay_parameter(*parameter, &mut input_events, total_buffer_len);
+                        continue;
+                    }
+                };
+                // The header is embedded in the original complete event, now owned by us.
+                unsafe {
+                    self.handle_input_event(header, &mut input_events, None, 0, total_buffer_len)
+                };
+            }
+        }
+        let Some(in_) = in_ else { return None };
 
         let num_events = unsafe {
             clap_call! { in_=>size(in_) }
@@ -1042,8 +1301,9 @@ impl<P: ClapPlugin> Wrapper<P> {
 
                 // Check the current event before applying it, including the first event in the
                 // buffer. A later event belongs to the next process slice.
-                if (*event).time > current_sample_idx as u32 && stop_predicate(event) {
-                    return Some(((*event).time as usize, event_idx as usize));
+                let event_time = ((*event).time as usize).min(total_buffer_len.saturating_sub(1));
+                if event_time > current_sample_idx && stop_predicate(event) {
+                    return Some((event_time, event_idx as usize));
                 }
 
                 self.handle_input_event(
@@ -1059,27 +1319,203 @@ impl<P: ClapPlugin> Wrapper<P> {
         None
     }
 
-    /// Write the unflushed parameter changes to the host's output event queue. The sample index is
-    /// used as part of splitting up the input buffer for sample accurate automation changes. This
-    /// will also modify the actual parameter values, since we should only do that while the wrapped
-    /// plugin is not actually processing audio.
-    ///
-    /// The `total_buffer_len` argument is used to clamp out of bounds events to the buffer's length.
+    /// Keep parameter changes and voice releases when a state restore excludes this callback.
+    /// CLAP event lists and cookies are borrowed, so only copy scalar data that we can replay.
+    unsafe fn defer_input(&self, in_: *const clap_input_events, include_releases: bool) {
+        let Some(in_) = (unsafe { in_.as_ref() }) else {
+            return;
+        };
+        let revision = self.next_revision();
+        let count = unsafe {
+            clap_call! { in_=>size(in_) }
+        };
+        for index in 0..count {
+            let event = unsafe {
+                clap_call! { in_=>get(in_, index) }
+            };
+            let Some(header) = (unsafe { event.as_ref() }) else {
+                continue;
+            };
+            if header.space_id != CLAP_CORE_EVENT_SPACE_ID {
+                continue;
+            }
+            let size = header.size as usize;
+            if let Some(parameter) = unsafe { DeferredParameter::from_event(event, revision) } {
+                if self.is_per_note_modulation(parameter) {
+                    self.defer_voice_modulation(parameter);
+                } else {
+                    // If the host exceeds the backlog, retain its newest global updates.
+                    self.deferred_parameters.force_push(parameter);
+                }
+                continue;
+            }
+
+            if !include_releases || P::MIDI_INPUT < MidiConfig::Basic {
+                continue;
+            }
+            let release = match header.type_ {
+                CLAP_EVENT_NOTE_OFF | CLAP_EVENT_NOTE_CHOKE
+                    if size >= mem::size_of::<clap_event_note>() =>
+                {
+                    let mut note = unsafe { *event.cast::<clap_event_note>() };
+                    note.header.time = 0;
+                    Some(DeferredVoiceEvent::NoteRelease(note))
+                }
+                CLAP_EVENT_MIDI if size >= mem::size_of::<clap_event_midi>() => {
+                    let mut midi = unsafe { *event.cast::<clap_event_midi>() };
+                    let status = midi.data[0] & 0xf0;
+                    let note_off = status == 0x80 || (status == 0x90 && midi.data[2] == 0);
+                    let release_cc = status == 0xb0
+                        && (matches!(midi.data[1], 120 | 123..=127)
+                            || (midi.data[1] == 64 && midi.data[2] < 64));
+                    if !note_off && !(P::MIDI_INPUT >= MidiConfig::MidiCCs && release_cc) {
+                        continue;
+                    }
+                    midi.header.time = 0;
+                    Some(DeferredVoiceEvent::MidiRelease(midi))
+                }
+                _ => None,
+            };
+            if let Some(release) = release
+                && self.deferred_voice_events.push(release).is_err()
+            {
+                // The next admitted process will reset voices if a release could not be saved.
+                self.reconcile_voices.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    fn clear_deferred_voice_events(&self) {
+        self.reconcile_voices.store(false, Ordering::Release);
+        for _ in 0..DEFERRED_EVENT_QUEUE_CAPACITY {
+            if self.deferred_voice_events.pop().is_none() {
+                break;
+            }
+        }
+    }
+
+    fn is_per_note_modulation(&self, parameter: DeferredParameter) -> bool {
+        parameter.event_type == CLAP_EVENT_PARAM_MOD
+            && parameter.note_id != -1
+            && P::MIDI_INPUT >= MidiConfig::Basic
+            && self.poly_mod_ids_by_hash.contains_key(&parameter.param_id)
+    }
+
+    fn defer_voice_modulation(&self, parameter: DeferredParameter) {
+        // The bounded queue preserves arrival order for voice events. Modulation cannot evict
+        // queued releases, since losing those can leave notes held indefinitely.
+        let _ = self
+            .deferred_voice_events
+            .push(DeferredVoiceEvent::Modulation(parameter));
+    }
+
+    fn replay_parameters(
+        &self,
+        input_events: &mut AtomicRefMut<VecDeque<PluginNoteEvent<P>>>,
+        total_buffer_len: usize,
+    ) {
+        for _ in 0..DEFERRED_EVENT_QUEUE_CAPACITY {
+            let Some(parameter) = self.deferred_parameters.pop() else {
+                break;
+            };
+            self.replay_parameter(parameter, input_events, total_buffer_len);
+        }
+    }
+
+    fn replay_parameter(
+        &self,
+        parameter: DeferredParameter,
+        input_events: &mut AtomicRefMut<VecDeque<PluginNoteEvent<P>>>,
+        total_buffer_len: usize,
+    ) {
+        let DeferredParameter {
+            param_id,
+            note_id,
+            value,
+            event_type,
+            revision,
+        } = parameter;
+        if event_type == CLAP_EVENT_PARAM_VALUE
+            && self
+                .restored_parameter_revisions
+                .get(&param_id)
+                .is_some_and(|cutoff| revision < cutoff.incoming.load(Ordering::Relaxed))
+        {
+            return;
+        }
+        let header = |size: usize| clap_event_header {
+            size: size as u32,
+            time: 0,
+            space_id: CLAP_CORE_EVENT_SPACE_ID,
+            type_: event_type,
+            flags: 0,
+        };
+        if event_type == CLAP_EVENT_PARAM_VALUE {
+            let event = clap_event_param_value {
+                header: header(mem::size_of::<clap_event_param_value>()),
+                param_id,
+                note_id,
+                value,
+                cookie: std::ptr::null_mut(),
+                port_index: -1,
+                channel: -1,
+                key: -1,
+            };
+            unsafe {
+                self.handle_input_event(&event.header, input_events, None, 0, total_buffer_len)
+            };
+        } else {
+            let event = clap_event_param_mod {
+                header: header(mem::size_of::<clap_event_param_mod>()),
+                param_id,
+                note_id,
+                amount: value,
+                cookie: std::ptr::null_mut(),
+                port_index: -1,
+                channel: -1,
+                key: -1,
+            };
+            unsafe {
+                self.handle_input_event(&event.header, input_events, None, 0, total_buffer_len)
+            };
+        }
+    }
+
+    /// Drain the bounded parameter queue in order, including any previously rejected head.
     ///
     /// # Safety
     ///
-    /// `out` must be a valid object (Clippy insists on there being a safety section here).
-    pub unsafe fn handle_out_events(&self, out: &clap_output_events, current_sample_idx: usize) {
-        // We'll always write these events to the first sample, so even when we add note output we
-        // shouldn't have to think about interleaving events here
-        let sample_rate = self.current_buffer_config.load().map(|c| c.sample_rate);
-        while let Some(change) = self.output_parameter_events.pop() {
+    /// `out` must remain valid for the duration of the call.
+    unsafe fn handle_out_events(
+        &self,
+        out: &clap_output_events,
+        time: u32,
+        mut accepted_value: impl FnMut(u32, f64),
+    ) {
+        let mut rejected = self.rejected_parameter_event.borrow_mut();
+        for _ in 0..=OUTPUT_EVENT_QUEUE_CAPACITY {
+            let Some(queued) = rejected
+                .take()
+                .or_else(|| self.output_parameter_events.pop())
+            else {
+                return;
+            };
+            let change = queued.event;
+            if let OutputParamEvent::SetValue { param_hash, .. } = change
+                && self
+                    .restored_parameter_revisions
+                    .get(&param_hash)
+                    .is_some_and(|cutoff| queued.revision < cutoff.outgoing.load(Ordering::Relaxed))
+            {
+                // Preserve the gesture boundaries and any unrelated or later values.
+                continue;
+            }
             let push_successful = match change {
                 OutputParamEvent::BeginGesture { param_hash } => {
                     let event = clap_event_param_gesture {
                         header: clap_event_header {
                             size: mem::size_of::<clap_event_param_gesture>() as u32,
-                            time: current_sample_idx as u32,
+                            time,
                             space_id: CLAP_CORE_EVENT_SPACE_ID,
                             type_: CLAP_EVENT_PARAM_GESTURE_BEGIN,
                             flags: CLAP_EVENT_IS_LIVE,
@@ -1095,16 +1531,10 @@ impl<P: ClapPlugin> Wrapper<P> {
                     param_hash,
                     clap_plain_value,
                 } => {
-                    self.update_plain_value_by_hash(
-                        param_hash,
-                        ClapParamUpdate::PlainValueSet(clap_plain_value),
-                        sample_rate,
-                    );
-
                     let event = clap_event_param_value {
                         header: clap_event_header {
                             size: mem::size_of::<clap_event_param_value>() as u32,
-                            time: current_sample_idx as u32,
+                            time,
                             space_id: CLAP_CORE_EVENT_SPACE_ID,
                             type_: CLAP_EVENT_PARAM_VALUE,
                             flags: CLAP_EVENT_IS_LIVE,
@@ -1126,7 +1556,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                     let event = clap_event_param_gesture {
                         header: clap_event_header {
                             size: mem::size_of::<clap_event_param_gesture>() as u32,
-                            time: current_sample_idx as u32,
+                            time,
                             space_id: CLAP_CORE_EVENT_SPACE_ID,
                             type_: CLAP_EVENT_PARAM_GESTURE_END,
                             flags: CLAP_EVENT_IS_LIVE,
@@ -1140,7 +1570,19 @@ impl<P: ClapPlugin> Wrapper<P> {
                 }
             };
 
-            crate::nice_debug_assert!(push_successful);
+            if !push_successful {
+                *rejected = Some(queued);
+                drop(rejected);
+                self.request_parameter_retry();
+                return;
+            }
+            if let OutputParamEvent::SetValue {
+                param_hash,
+                clap_plain_value,
+            } = change
+            {
+                accepted_value(param_hash, clap_plain_value);
+            }
         }
     }
 
@@ -1489,65 +1931,20 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
     }
 
-    /// Update the plugin's internal state, called by the plugin itself from the GUI thread. To
-    /// prevent corrupting data and changing parameters during processing the actual state is only
-    /// updated at the end of the audio processing cycle.
+    /// Restore a preset before returning to the editor, even during a long offline process call.
+    #[cfg(feature = "editor")]
     pub fn set_state_object_from_gui(&self, mut state: PluginState) {
-        let mut did_set_state_inner = false;
-
-        // Use a loop and timeouts to handle the super rare edge case when this function gets called
-        // between a process call and the host disabling the plugin
-        loop {
-            if self.is_processing.load(Ordering::SeqCst) {
-                // If the plugin is currently processing audio, then we'll perform the restore
-                // operation at the end of the audio call. This involves sending the state to the
-                // audio thread, having the audio thread handle the state restore at the very end of
-                // the process function, and then sending the state back to this thread so it can be
-                // deallocated without blocking the audio thread.
-                match self
-                    .updated_state_sender
-                    .send_timeout(state, Duration::from_secs(1))
-                {
-                    Ok(_) => {
-                        // As mentioned above, the state object will be passed back to this thread
-                        // so we can deallocate it without blocking.
-                        let state = self.updated_state_receiver.recv();
-                        drop(state);
-                        break;
-                    }
-                    Err(SendTimeoutError::Timeout(value)) => {
-                        state = value;
-                        continue;
-                    }
-                    Err(SendTimeoutError::Disconnected(_)) => {
-                        crate::nice_debug_assert_failure!("State update channel got disconnected");
-                        return;
-                    }
-                }
-            } else {
-                // Otherwise we'll set the state right here and now, since this function should be
-                // called from a GUI thread
-                self.set_state_inner(&mut state);
-                did_set_state_inner = true;
-                break;
-            }
-        }
-
-        if !did_set_state_inner {
-            // After the state has been updated, notify the host about the new parameter values
-            let task_posted = self.schedule_gui(Task::RescanParamValues);
-            crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
-        } // Else the RescanParamValues task has already been sent
+        self.try_set_state(&mut state, None);
     }
 
     pub fn set_latency_samples(&self, samples: u32) {
-        // Only make a callback if it's actually needed
-        // XXX: For CLAP we could move this handling to the Plugin struct, but it may be worthwhile
-        //      to keep doing it this way to stay consistent with VST3.
-        let old_latency = self.current_latency.swap(samples, Ordering::SeqCst);
-        if old_latency != samples {
-            let task_posted = self.schedule_gui(Task::LatencyChanged);
-            crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
+        self.pending_latency.store(samples, Ordering::SeqCst);
+        if samples != self.current_latency.load(Ordering::SeqCst)
+            && self.is_activated.load(Ordering::SeqCst)
+            && !self.latency_restart_requested.swap(true, Ordering::SeqCst)
+        {
+            // CLAP request_restart is thread-safe. The host may enact it later.
+            self.request_restart();
         }
     }
 
@@ -1632,42 +2029,53 @@ impl<P: ClapPlugin> Wrapper<P> {
         });
     }
 
-    /// Immediately set the plugin state. Returns `false` if the deserialization failed. The plugin
-    /// state is set from a couple places, so this function aims to deduplicate that. Includes
-    /// `permit_alloc()`s around the deserialization and initialization for the use case where
-    /// `set_state_object_from_gui()` was called while the plugin is process audio.
-    ///
-    /// Implicitly emits `Task::ParameterValuesChanged`.
-    ///
-    /// # Notes
-    ///
-    /// `self.plugin` must _not_ be locked while calling this function or it will deadlock.
+    /// Apply state on a non-audio thread, waiting briefly for an in-flight block or flush.
     pub fn set_state_inner(&self, state: &mut PluginState) -> bool {
-        // FIXME: This is obviously not realtime-safe, but loading presets without doing this
-        //        could lead to inconsistencies. `state::deserialize_object()` normally never
-        //        allocates, but if the plugin has persistent non-parameter data then its
-        //        `deserialize_fields()` implementation may still allocate.
-        let success = permit_alloc(|| unsafe {
-            state::deserialize_object::<P>(
-                state,
-                self.params.clone(),
-                state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash),
-                self.current_buffer_config.load().as_ref(),
-            )
+        self.try_set_state(state, Some(STATE_ACCESS_TIMEOUT))
+            .unwrap_or_else(|| {
+                crate::nice_warn!("Could not acquire exclusive access to restore plugin state");
+                false
+            })
+    }
+
+    /// None means the gate was busy. Some(false) means the state failed validation.
+    fn try_set_state(&self, state: &mut PluginState, timeout: Option<Duration>) -> Option<bool> {
+        let revision = self.next_revision();
+        let result = self.state_access.with_control(timeout, || {
+            // SAFETY: The parameter pointers remain live, and neither process nor flush is active.
+            let success = unsafe {
+                state::deserialize_object::<P>(
+                    state,
+                    self.params.clone(),
+                    state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash),
+                    self.current_buffer_config.load().as_ref(),
+                )
+            };
+            if success {
+                let output_cutoff = self.next_revision();
+                // The migration hook may change the parameter set. Supersede only saved
+                // parameters actually resolved by this restore.
+                for id in state.params.keys() {
+                    if let Some(hash) = self.param_id_to_hash.get(id) {
+                        let cutoff = &self.restored_parameter_revisions[hash];
+                        cutoff.incoming.store(revision, Ordering::Relaxed);
+                        cutoff.outgoing.store(output_cutoff, Ordering::Relaxed);
+                    }
+                }
+            }
+            success
         });
-        if !success {
-            crate::nice_debug_assert_failure!(
-                "Deserializing plugin state from a state object failed"
-            );
-            return false;
+        if self.parameter_retry_requested.load(Ordering::Acquire) {
+            // A main-thread callback may have observed the gate still held. It must get a
+            // chance to issue request_flush after this control request retires.
+            self.request_main_callback();
         }
-
-        // Reinitialize the plugin after loading state so it can respond to the new parameter values,
-        // and tell the host to rescan the parameter values.
-        let task_posted = self.schedule_gui(Task::StateChanged);
-        crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
-
-        success
+        if result == Some(true) {
+            // Notify after releasing the gate so a host callback can query the latest values.
+            let task_posted = self.schedule_gui(Task::StateChanged);
+            crate::nice_debug_assert!(task_posted, "The task queue is full, dropping task...");
+        }
+        result
     }
 
     pub fn request_restart(&self) {
@@ -1716,6 +2124,11 @@ impl<P: ClapPlugin> Wrapper<P> {
     unsafe extern "C" fn destroy(plugin: *const clap_plugin) {
         assert!(!plugin.is_null() && unsafe { !(*plugin).plugin_data.is_null() });
         let this = unsafe { Arc::from_raw((*plugin).plugin_data as *mut Self) };
+        #[cfg(feature = "editor")]
+        {
+            *this.editor_tasks_open.write() = false;
+        }
+        this.background_thread.close();
         crate::nice_debug_assert_eq!(Arc::strong_count(&this), 1);
 
         drop(this);
@@ -1741,14 +2154,6 @@ impl<P: ClapPlugin> Wrapper<P> {
         // Before initializing the plugin, make sure all smoothers are set the the default values
         for param in wrapper.param_by_hash.values() {
             unsafe { param._internal_update_smoother(buffer_config.sample_rate, true) };
-        }
-
-        // If this reactivation happened due to the latency changing, notify the host of that
-        // latency change.
-        if wrapper.latency_changed.swap(false, Ordering::SeqCst)
-            && let Some(host_latency) = &*wrapper.host_latency.borrow()
-        {
-            unsafe_clap_call! { host_latency=>changed(&*wrapper.host_callback) };
         }
 
         let mut activate_context = wrapper.make_activate_context();
@@ -1778,8 +2183,6 @@ impl<P: ClapPlugin> Wrapper<P> {
                             // Also store this for later, so we can reinitialize the plugin after restoring state
                             wrapper.current_buffer_config.store(Some(buffer_config));
 
-                            wrapper.is_activated.store(true, Ordering::SeqCst);
-
                             result = true;
 
                             break;
@@ -1803,8 +2206,25 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
         }
 
-        // NOTE: This needs to be dropped after the `plugin` lock to avoid deadlocks
-        drop(activate_context);
+        if result {
+            // The plugin and buffer locks are released. The host may query latency from this
+            // notification, which CLAP allows only while activation is still in progress.
+            let latency = activate_context
+                .requested_latency()
+                .unwrap_or_else(|| wrapper.pending_latency.load(Ordering::SeqCst));
+            wrapper.pending_latency.store(latency, Ordering::SeqCst);
+            let previous = wrapper.current_latency.swap(latency, Ordering::SeqCst);
+            wrapper
+                .latency_restart_requested
+                .store(false, Ordering::SeqCst);
+            if previous != latency
+                && let Some(host_latency) = &*wrapper.host_latency.borrow()
+                && let Some(changed) = host_latency.changed
+            {
+                unsafe { changed(&*wrapper.host_callback) };
+            }
+            wrapper.is_activated.store(true, Ordering::SeqCst);
+        }
 
         result
     }
@@ -1832,14 +2252,11 @@ impl<P: ClapPlugin> Wrapper<P> {
     }
 
     unsafe extern "C" fn start_processing(plugin: *const clap_plugin) -> bool {
-        // We just need to keep track of our processing state so we can request a flush when
-        // updating parameters from the GUI while the processing loop isn't running
         check_null_ptr!(false, plugin, unsafe { (*plugin).plugin_data });
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
 
         // Always reset the processing status when the plugin gets activated or deactivated
         wrapper.last_process_status.store(ProcessStatus::Normal);
-        wrapper.is_processing.store(true, Ordering::SeqCst);
 
         // To be consistent with the VST3 wrapper, we'll also reset the buffers here in addition to
         // the dedicated `reset()` function.
@@ -1850,6 +2267,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             loop {
                 if let Some(mut plugin) = wrapper.plugin.try_lock() {
                     plugin.reset();
+                    wrapper.clear_deferred_voice_events();
                     break;
                 } else if now.elapsed() > Duration::from_millis(200) {
                     crate::nice_error!(
@@ -1868,8 +2286,6 @@ impl<P: ClapPlugin> Wrapper<P> {
     unsafe extern "C" fn stop_processing(plugin: *const clap_plugin) {
         check_null_ptr!((), plugin, unsafe { (*plugin).plugin_data });
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
-
-        wrapper.is_processing.store(false, Ordering::SeqCst);
 
         process_wrapper(|| {
             // In the case a host misbehaves and tries to activate/deactivate the plugin without
@@ -1902,6 +2318,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             loop {
                 if let Some(mut plugin) = wrapper.plugin.try_lock() {
                     plugin.reset();
+                    wrapper.clear_deferred_voice_events();
                     break;
                 } else if now.elapsed() > Duration::from_millis(200) {
                     crate::nice_error!("Failed to acquire lock on plugin while resetting");
@@ -1933,8 +2350,30 @@ impl<P: ClapPlugin> Wrapper<P> {
             // we'll process every incoming event.
             let process = unsafe { &*process };
             let total_buffer_len = process.frames_count as usize;
+            let Some(buffer_config) = wrapper.current_buffer_config.load() else {
+                return CLAP_PROCESS_ERROR;
+            };
+            if process.frames_count > buffer_config.max_buffer_size {
+                return CLAP_PROCESS_ERROR;
+            }
 
             let current_audio_io_layout = wrapper.current_audio_io_layout.load();
+            let Some(_state_access) = wrapper.state_access.try_audio() else {
+                // SAFETY: The host owns the events and buffers for this call.
+                unsafe {
+                    wrapper.defer_input(process.in_events, true);
+                    silence_audio_outputs(process, current_audio_io_layout);
+                };
+                return CLAP_PROCESS_CONTINUE;
+            };
+            if wrapper.reconcile_voices.swap(false, Ordering::AcqRel) {
+                let Some(mut plugin) = wrapper.plugin.try_lock() else {
+                    wrapper.reconcile_voices.store(true, Ordering::Release);
+                    return CLAP_PROCESS_ERROR;
+                };
+                plugin.reset();
+                wrapper.clear_deferred_voice_events();
+            }
             let has_main_input = current_audio_io_layout.main_input_channels.is_some();
             let has_main_output = current_audio_io_layout.main_output_channels.is_some();
             let aux_input_start_idx = if has_main_input { 1 } else { 0 };
@@ -1943,18 +2382,19 @@ impl<P: ClapPlugin> Wrapper<P> {
             // If `P::SAMPLE_ACCURATE_AUTOMATION` is set, then we'll split up the audio buffer into
             // chunks whenever a parameter change occurs
             let mut block_start = 0;
-            let mut block_end = total_buffer_len;
             let mut event_start_idx = 0;
 
             // The host may send new transport information as an event. In that case we'll also
             // split the buffer.
             let mut transport_info = process.transport;
+            let mut transport_offset = 0;
 
             let result = loop {
-                if !process.in_events.is_null() {
+                let block_end = {
+                    let previous_transport = transport_info;
                     let split_result = unsafe {
                         wrapper.handle_in_events_until(
-                            &*process.in_events,
+                            process.in_events.as_ref(),
                             &mut transport_info,
                             block_start,
                             total_buffer_len,
@@ -1991,18 +2431,22 @@ impl<P: ClapPlugin> Wrapper<P> {
                         )
                     };
 
+                    if transport_info != previous_transport {
+                        transport_offset = unsafe { (*transport_info).header.time as usize };
+                    }
+
                     // If there are any parameter changes after `block_start` and sample
                     // accurate automation is enabled or the host sends new transport
                     // information, then we'll process a new block just after that. Otherwise we can
                     // process all audio until the end of the buffer.
                     match split_result {
                         Some((next_param_change_sample_idx, next_param_change_event_idx)) => {
-                            block_end = next_param_change_sample_idx;
                             event_start_idx = next_param_change_event_idx;
+                            next_param_change_sample_idx
                         }
-                        None => block_end = total_buffer_len,
+                        None => total_buffer_len,
                     }
-                }
+                };
 
                 // After processing the events we now know where/if the block should be split, and
                 // we can start preparing audio processing
@@ -2062,7 +2506,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 .enumerate()
                             {
                                 let aux_input_idx = aux_input_no + aux_input_start_idx;
-                                if aux_input_idx > process.audio_inputs_count as usize {
+                                if aux_input_idx >= process.audio_inputs_count as usize {
                                     break;
                                 }
 
@@ -2086,7 +2530,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                                 .enumerate()
                             {
                                 let aux_output_idx = aux_output_no + aux_output_start_idx;
-                                if aux_output_idx > process.audio_outputs_count as usize {
+                                if aux_output_idx >= process.audio_outputs_count as usize {
                                     break;
                                 }
 
@@ -2124,26 +2568,22 @@ impl<P: ClapPlugin> Wrapper<P> {
                     }
                 }
 
-                crate::nice_debug_assert!(buffer_is_valid);
-
                 // Some of the fields are left empty because CLAP does not provide this information,
                 // but the methods on [`Transport`] can reconstruct these values from the other
                 // fields
-                let sample_rate = wrapper
-                    .current_buffer_config
-                    .load()
-                    .expect("Process call without prior initialization call")
-                    .sample_rate;
+                let sample_rate = buffer_config.sample_rate;
                 let mut transport = Transport::new(sample_rate);
                 if !transport_info.is_null() {
                     let context = unsafe { &*transport_info };
+                    let elapsed_samples = block_start.saturating_sub(transport_offset);
+                    let elapsed = elapsed_samples as f64;
 
                     transport.playing = context.flags & CLAP_TRANSPORT_IS_PLAYING != 0;
                     transport.recording = context.flags & CLAP_TRANSPORT_IS_RECORDING != 0;
                     transport.preroll_active =
                         Some(context.flags & CLAP_TRANSPORT_IS_WITHIN_PRE_ROLL != 0);
                     if context.flags & CLAP_TRANSPORT_HAS_TEMPO != 0 {
-                        transport.tempo = Some(context.tempo);
+                        transport.tempo = Some(context.tempo + elapsed * context.tempo_inc);
                     }
                     if context.flags & CLAP_TRANSPORT_HAS_TIME_SIGNATURE != 0 {
                         transport.time_sig_numerator = Some(context.tsig_num as i32);
@@ -2152,51 +2592,27 @@ impl<P: ClapPlugin> Wrapper<P> {
                     if context.flags & CLAP_TRANSPORT_HAS_BEATS_TIMELINE != 0 {
                         let beats = context.song_pos_beats as f64 / CLAP_BEATTIME_FACTOR as f64;
 
-                        // This is a bit messy, but we'll try to compensate for the block splitting.
-                        // We can't use the functions on the transport information object for this
-                        // because we don't have any sample information.
-                        if P::SAMPLE_ACCURATE_AUTOMATION
-                            && block_start > 0
-                            && (context.flags & CLAP_TRANSPORT_HAS_TEMPO != 0)
-                        {
-                            transport.pos_beats = Some(
-                                beats
-                                    + (block_start as f64 / sample_rate as f64 / 60.0
-                                        * context.tempo),
-                            );
+                        let advance = if transport.playing && transport.tempo.is_some() {
+                            // Sum the tempo at each elapsed sample, from the snapshot's tempo
+                            // through the last sample before this slice.
+                            let last_offset = elapsed_samples.saturating_sub(1) as f64;
+                            elapsed * (context.tempo + last_offset * context.tempo_inc * 0.5)
+                                / (f64::from(sample_rate) * 60.0)
                         } else {
-                            transport.pos_beats = Some(beats);
-                        }
+                            0.0
+                        };
+                        transport.pos_beats = Some(beats + advance);
                     }
                     if context.flags & CLAP_TRANSPORT_HAS_SECONDS_TIMELINE != 0 {
                         let seconds = context.song_pos_seconds as f64 / CLAP_SECTIME_FACTOR as f64;
-
-                        // Same here
-                        if P::SAMPLE_ACCURATE_AUTOMATION
-                            && block_start > 0
-                            && (context.flags & CLAP_TRANSPORT_HAS_TEMPO != 0)
-                        {
-                            transport.pos_seconds =
-                                Some(seconds + (block_start as f64 / sample_rate as f64));
+                        let advance = if transport.playing {
+                            elapsed / f64::from(sample_rate)
                         } else {
-                            transport.pos_seconds = Some(seconds);
-                        }
-                    }
-                    // TODO: CLAP does not mention whether this is behind a flag or not
-                    if P::SAMPLE_ACCURATE_AUTOMATION && block_start > 0 {
-                        transport.bar_start_pos_beats = match transport.bar_start_pos_beats() {
-                            Some(updated) => Some(updated),
-                            None => Some(context.bar_start as f64 / CLAP_BEATTIME_FACTOR as f64),
+                            0.0
                         };
-                        transport.bar_number = match transport.bar_number() {
-                            Some(updated) => Some(updated),
-                            None => Some(context.bar_number),
-                        };
-                    } else {
-                        transport.bar_start_pos_beats =
-                            Some(context.bar_start as f64 / CLAP_BEATTIME_FACTOR as f64);
-                        transport.bar_number = Some(context.bar_number);
+                        transport.pos_seconds = Some(seconds + advance);
                     }
+                    advance_transport_bar(&mut transport, context, elapsed_samples);
                     // TODO: They also aren't very clear about this, but presumably if the loop is
                     //       active and the corresponding song transport information is available then
                     //       this is also available
@@ -2238,15 +2654,32 @@ impl<P: ClapPlugin> Wrapper<P> {
                         outputs: buffers.aux_outputs,
                     };
 
+                    let mut accepted = wrapper.accepted_output_parameter_values.borrow_mut();
+                    if let Some(out) = unsafe { process.out_events.as_ref() } {
+                        unsafe {
+                            wrapper.handle_out_events(out, block_start as u32, |id, value| {
+                                accepted.push((id, value));
+                            });
+                        }
+                    }
+
+                    for (id, value) in accepted.drain(..) {
+                        wrapper.update_plain_value_by_hash(
+                            id,
+                            ClapParamUpdate::PlainValueSet(value),
+                            Some(sample_rate),
+                        );
+                    }
+                    drop(accepted);
+
                     let mut context = wrapper.make_process_context(
                         transport,
-                        total_buffer_len,
+                        block_end,
                         block_start,
                         process.out_events,
                     );
 
                     let result = plugin.process(buffers.main_buffer, &mut aux, &mut context);
-
                     wrapper.last_process_status.store(result);
                     result
                 } else {
@@ -2264,10 +2697,6 @@ impl<P: ClapPlugin> Wrapper<P> {
                     ProcessStatus::KeepAlive => CLAP_PROCESS_CONTINUE,
                 };
 
-                if !process.out_events.is_null() && !wrapper.output_parameter_events.is_empty() {
-                    unsafe { wrapper.handle_out_events(&*process.out_events, block_start) };
-                }
-
                 // If our block ends at the end of the buffer then that means there are no more
                 // unprocessed (parameter) events. If there are more events, we'll just keep going
                 // through this process until we've processed the entire buffer.
@@ -2278,28 +2707,25 @@ impl<P: ClapPlugin> Wrapper<P> {
                 }
             };
 
-            // After processing audio, we'll check if the editor has sent us updated plugin state.
-            // We'll restore that here on the audio thread to prevent changing the values during the
-            // process call and also to prevent inconsistent state when the host also wants to load
-            // plugin state.
-            // FIXME: Zero capacity channels allocate on receiving, find a better alternative that
-            //        doesn't do that
-            let updated_state = permit_alloc(|| wrapper.updated_state_receiver.try_recv());
-            if let Ok(mut state) = updated_state {
-                wrapper.set_state_inner(&mut state);
-
-                // We'll pass the state object back to the GUI thread so deallocation can happen
-                // there without potentially blocking the audio thread
-                if let Err(err) = wrapper.updated_state_sender.send(state) {
-                    crate::nice_debug_assert_failure!(
-                        "Failed to send state object back to GUI thread: {}",
-                        err
-                    );
-                };
-            }
-
             result
         })
+    }
+
+    /// Looks up the numeric ID reported by CLAP params for an author's parameter ID.
+    ///
+    /// Returns None for an unknown author ID. An initialized wrapper has a unique parameter
+    /// inventory. This uses the same maps as the live CLAP parameter wrapper.
+    ///
+    /// # Safety
+    ///
+    /// `plugin` must be a live CLAP plugin created by this `Wrapper<P>`, or null.
+    pub unsafe fn custom_extension_param_id(
+        plugin: *const clap_plugin,
+        author_id: &str,
+    ) -> Option<clap_id> {
+        check_null_ptr!(None, plugin, unsafe { (*plugin).plugin_data });
+        let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
+        wrapper.param_id_to_hash.get(author_id).copied()
     }
 
     unsafe extern "C" fn get_extension(
@@ -2362,8 +2788,12 @@ impl<P: ClapPlugin> Wrapper<P> {
                 std::ptr::null()
             }
         } else {
-            crate::nice_trace!("Host tried to query unknown extension {:?}", id);
-            std::ptr::null()
+            // SAFETY: Implementors provide the matching, thread-safe extension table.
+            let custom = unsafe { P::clap_custom_extension(id) };
+            if custom.is_null() {
+                crate::nice_trace!("Host tried to query unknown extension {:?}", id);
+            }
+            custom
         }
     }
 
@@ -2387,6 +2817,16 @@ impl<P: ClapPlugin> Wrapper<P> {
         // on the main thread, so once that's done we can just handle all requests here
         while let Some(task) = wrapper.tasks.pop() {
             wrapper.execute(task, true);
+        }
+
+        if !wrapper.state_access.control_pending.load(Ordering::Acquire)
+            && wrapper
+                .parameter_retry_requested
+                .swap(false, Ordering::AcqRel)
+            && let Some(host_params) = &*wrapper.host_params.borrow()
+            && let Some(request_flush) = host_params.request_flush
+        {
+            unsafe { request_flush(&*wrapper.host_callback) };
         }
     }
 
@@ -2534,21 +2974,22 @@ impl<P: ClapPlugin> Wrapper<P> {
         let is_main_port =
             index == 0 && ((is_input && has_main_input) || (!is_input && has_main_output));
 
-        // We'll number the ports in a linear order from `0..num_input_ports` and
-        // `num_input_ports..(num_input_ports + num_output_ports)`
+        // Keep the IDs advertised by the default configuration. Adding input ports to another
+        // configuration must not shift the output IDs or the in-place pair.
+        let default_layout = P::AUDIO_IO_LAYOUTS.first().copied().unwrap_or_default();
+        let output_id_base = u32::from(default_layout.main_input_channels.is_some())
+            + default_layout.aux_input_ports.len() as u32;
         let stable_id = if is_input {
             index
         } else {
-            index + num_input_ports
+            index + output_id_base
         };
 
         // Allow processing the main input/output ports in-place if their channel count is the same.
         let can_process_in_place = current_audio_io_layout.main_input_channels
             == current_audio_io_layout.main_output_channels;
         let pair_stable_id = match (is_input, is_main_port) {
-            // Ports are named linearly with inputs coming before outputs, so this is the index of
-            // the first output port
-            (true, true) if has_main_output && can_process_in_place => num_input_ports,
+            (true, true) if has_main_output && can_process_in_place => output_id_base,
             (false, true) if has_main_input && can_process_in_place => 0,
             _ => CLAP_INVALID_ID,
         };
@@ -2706,7 +3147,7 @@ impl<P: ClapPlugin> Wrapper<P> {
 
                 struct ClapHostCallbacks<P: ClapPlugin> {
                     wrapper: Weak<Wrapper<P>>,
-                    host_gui: ClapPtr<clap_host_gui>,
+                    host_gui: Option<ClapPtr<clap_host_gui>>,
                 }
 
                 impl<P: ClapPlugin> HostCallbacks for ClapHostCallbacks<P> {
@@ -2715,42 +3156,44 @@ impl<P: ClapPlugin> Wrapper<P> {
                         new_size: Size,
                         scale_factor: f64,
                     ) -> Result<(), Box<dyn Error>> {
-                        if let Some(wrapper) = self.wrapper.upgrade() {
-                            use nice_plug_core::editor::dpi::NativeSize;
+                        use nice_plug_core::editor::dpi::NativeSize;
 
-                            let native_size = NativeSize::from_size(new_size, scale_factor);
-
-                            if unsafe_clap_call! {
-                                &*self.host_gui=>request_resize(
-                                    &*wrapper.host_callback,
-                                    native_size.width,
-                                    native_size.height,
-                                )
-                            } {
-                                Ok(())
-                            } else {
-                                Err(ResizeError::HostRefusedSize(new_size).into())
-                            }
+                        let Some(wrapper) = self.wrapper.upgrade() else {
+                            return Err(ResizeError::PluginClosed.into());
+                        };
+                        let Some(request_resize) =
+                            self.host_gui.as_ref().and_then(|gui| gui.request_resize)
+                        else {
+                            return Err(ResizeError::HostRefusedSize(new_size).into());
+                        };
+                        let native_size = NativeSize::from_size(new_size, scale_factor);
+                        // SAFETY: The live wrapper holds the host and the callback's vtable.
+                        if unsafe {
+                            request_resize(
+                                &*wrapper.host_callback,
+                                native_size.width,
+                                native_size.height,
+                            )
+                        } {
+                            Ok(())
                         } else {
-                            Err(ResizeError::PluginClosed.into())
+                            Err(ResizeError::HostRefusedSize(new_size).into())
                         }
                     }
 
                     fn destroyed(&mut self) {
-                        if let Some(wrapper) = self.wrapper.upgrade() {
-                            unsafe_clap_call! {
-                                &*self.host_gui=>closed(
-                                    &*wrapper.host_callback,
-                                    true,
-                                )
-                            }
+                        if let Some(wrapper) = self.wrapper.upgrade()
+                            && let Some(closed) = self.host_gui.as_ref().and_then(|gui| gui.closed)
+                        {
+                            // SAFETY: The live wrapper holds the host and the callback's vtable.
+                            unsafe { closed(&*wrapper.host_callback, true) };
                         }
                     }
                 }
 
                 let callbacks: Box<dyn HostCallbacks> = Box::new(ClapHostCallbacks {
                     wrapper: wrapper.this.borrow().clone(),
-                    host_gui: ClapPtr::clone(wrapper.host_gui.borrow().as_ref().unwrap()),
+                    host_gui: wrapper.host_gui.borrow().clone(),
                 });
 
                 struct ClapHostMainThreadCaller<P: ClapPlugin> {
@@ -3160,11 +3603,9 @@ impl<P: ClapPlugin> Wrapper<P> {
         check_null_ptr!(false, plugin, unsafe { (*plugin).plugin_data }, param_info);
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
 
-        if param_index > unsafe { Self::ext_params_count(plugin) } {
+        let Some(param_hash) = wrapper.param_hashes.get(param_index as usize) else {
             return false;
-        }
-
-        let param_hash = &wrapper.param_hashes[param_index as usize];
+        };
         let param_group = &wrapper.param_group_by_hash[param_hash];
         let param_ptr = &wrapper.param_by_hash[param_hash];
         let default_value = unsafe { param_ptr.default_normalized_value() };
@@ -3197,7 +3638,10 @@ impl<P: ClapPlugin> Wrapper<P> {
             param_info.flags |= CLAP_PARAM_IS_BYPASS
         }
         if step_count.is_some() {
-            param_info.flags |= CLAP_PARAM_IS_STEPPED
+            param_info.flags |= CLAP_PARAM_IS_STEPPED;
+            if wrapper.enum_param_hashes.contains(param_hash) {
+                param_info.flags |= CLAP_PARAM_IS_ENUM;
+            }
         }
         param_info.cookie = std::ptr::null_mut();
         strlcpy(&mut param_info.name, unsafe { param_ptr.name() });
@@ -3210,7 +3654,7 @@ impl<P: ClapPlugin> Wrapper<P> {
         // range option
         // TODO: This should probably be encapsulated in some way so we don't forget about this in one place
         param_info.max_value = step_count.unwrap_or(1) as f64;
-        param_info.default_value = default_value as f64 * step_count.unwrap_or(1) as f64;
+        param_info.default_value = clap_plain_from_normalized(default_value, step_count);
 
         true
     }
@@ -3226,8 +3670,10 @@ impl<P: ClapPlugin> Wrapper<P> {
         match wrapper.param_by_hash.get(&param_id) {
             Some(param_ptr) => {
                 unsafe {
-                    *value = param_ptr.modulated_normalized_value() as f64
-                        * param_ptr.step_count().unwrap_or(1) as f64;
+                    *value = clap_plain_from_normalized(
+                        param_ptr.modulated_normalized_value(),
+                        param_ptr.step_count(),
+                    );
                 }
 
                 true
@@ -3255,7 +3701,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                         dest,
                         // CLAP does not have a separate unit, so we'll include the unit here
                         &param_ptr.normalized_value_to_string(
-                            value as f32 / param_ptr.step_count().unwrap_or(1) as f32,
+                            clap_normalized_for_text(value, param_ptr.step_count()),
                             true,
                         ),
                     );
@@ -3291,11 +3737,11 @@ impl<P: ClapPlugin> Wrapper<P> {
             Some(param_ptr) => {
                 let normalized_value =
                     match unsafe { param_ptr.string_to_normalized_value(display) } {
-                        Some(v) => v as f64,
+                        Some(v) => v,
                         None => return false,
                     };
                 unsafe {
-                    *value = normalized_value * param_ptr.step_count().unwrap_or(1) as f64;
+                    *value = clap_plain_from_normalized(normalized_value, param_ptr.step_count());
                 }
 
                 true
@@ -3311,16 +3757,28 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) {
         check_null_ptr!((), plugin, unsafe { (*plugin).plugin_data });
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
+        let Some(_state_access) = wrapper.state_access.try_audio() else {
+            // SAFETY: The host's list is valid for this callback and only scalar data is copied.
+            unsafe { wrapper.defer_input(in_, false) };
+            wrapper.request_parameter_retry();
+            return;
+        };
 
-        if !in_.is_null() {
-            unsafe {
-                wrapper.handle_in_events(&*in_, 0, 0);
-            }
-        }
+        unsafe { wrapper.handle_flush_events(in_.as_ref()) };
 
-        if !out.is_null() {
+        if let Some(out) = unsafe { out.as_ref() } {
+            let sample_rate = wrapper
+                .current_buffer_config
+                .load()
+                .map(|config| config.sample_rate);
             unsafe {
-                wrapper.handle_out_events(&*out, 0);
+                wrapper.handle_out_events(out, 0, |id, value| {
+                    wrapper.update_plain_value_by_hash(
+                        id,
+                        ClapParamUpdate::PlainValueSet(value),
+                        sample_rate,
+                    );
+                });
             }
         }
     }
@@ -3391,28 +3849,18 @@ impl<P: ClapPlugin> Wrapper<P> {
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
 
         let serialized = unsafe {
-            state::serialize_json::<P>(
+            state::serialize_json_bounded::<P>(
                 wrapper.params.clone(),
                 state::make_params_iter(&wrapper.param_by_hash, &wrapper.param_id_to_hash),
+                MAX_STATE_BYTES,
             )
         };
         match serialized {
             Ok(serialized) => {
-                // CLAP does not provide a way to tell how much data there is left in a stream, so
-                // we need to prepend it to our actual state data.
-                let length_bytes = (serialized.len() as u64).to_le_bytes();
-                if !write_stream(unsafe { &*stream }, &length_bytes) {
-                    crate::nice_error!(
-                        "Failed to save state: Error or end of stream while writing the state \
-                         length"
-                    );
-                    return false;
-                }
-                if !write_stream(unsafe { &*stream }, &serialized) {
-                    crate::nice_error!(
-                        "Failed to save state: Error or end of stream while writing the state \
-                         buffer"
-                    );
+                if let Err(error) =
+                    write_state_record(unsafe { &*stream }, &serialized, MAX_STATE_BYTES)
+                {
+                    crate::nice_error!("Failed to save state: {error}");
                     return false;
                 }
 
@@ -3434,40 +3882,15 @@ impl<P: ClapPlugin> Wrapper<P> {
         check_null_ptr!(false, plugin, unsafe { (*plugin).plugin_data }, stream);
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
 
-        // CLAP does not have a way to tell how much data there is left in a stream, so we've
-        // prepended the size in front of our JSON state
-        let mut length_bytes = [0u8; 8];
-        let bytes_read = read_stream(unsafe { &*stream }, length_bytes.as_mut_slice());
-        if bytes_read != Some(8) {
-            crate::nice_error!(
-                "Failed to load state: Error or end of stream while reading the state length"
-            );
-            return false;
-        }
-        let length = u64::from_le_bytes(length_bytes);
-        // Protect against OOM errors if the metadata is malformed.
-        if length > MAX_STATE_BYTES {
-            crate::nice_error!("Failed to load state: Malformed length");
-            return false;
-        }
-
-        let mut read_buffer: Vec<u8> = Vec::new();
-
-        if read_buffer.try_reserve_exact(length as usize).is_err() {
-            crate::nice_error!("Failed to load state: Failed to allocate buffer for state stream");
-            return false;
-        }
-
-        let bytes_read = read_stream(unsafe { &*stream }, read_buffer.spare_capacity_mut());
-        let Some(bytes_read) = bytes_read else {
-            crate::nice_error!("Failed to load state: Error while reading the state buffer");
-            return false;
+        let read_buffer = match read_state_record(unsafe { &*stream }, MAX_STATE_BYTES) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                crate::nice_error!("Failed to load state: {error}");
+                return false;
+            }
         };
-        unsafe {
-            read_buffer.set_len(bytes_read);
-        }
 
-        match unsafe { state::deserialize_json(&read_buffer) } {
+        match state::deserialize_json_bounded(&read_buffer, MAX_STATE_BYTES) {
             Some(mut state) => {
                 let success = wrapper.set_state_inner(&mut state);
                 if success {
@@ -3527,6 +3950,37 @@ impl<P: ClapPlugin> Wrapper<P> {
     }
 }
 
+/// Converts the wrapper's normalized parameter representation to CLAP's plain values.
+pub(super) fn clap_plain_from_normalized(normalized: f32, step_count: Option<usize>) -> f64 {
+    match step_count {
+        Some(steps) => (f64::from(normalized) * steps as f64).round(),
+        None => f64::from(normalized),
+    }
+}
+
+fn clap_normalized_for_text(value: f64, step_count: Option<usize>) -> f32 {
+    // An enum with one variant has no steps and always uses its first label.
+    value as f32 / step_count.unwrap_or(1).max(1) as f32
+}
+
+/// The parameter pointer must be kept alive by the author's Params Arc.
+unsafe fn has_enum_value_text(param: ParamPtr) -> bool {
+    if !matches!(param, ParamPtr::EnumParam(_)) {
+        return false;
+    }
+    let Some(steps) = (unsafe { param.step_count() }) else {
+        return false;
+    };
+    (0..=steps).all(|index| {
+        let normalized = clap_normalized_for_text(index as f64, Some(steps));
+        let text = unsafe { param.normalized_value_to_string(normalized, true) };
+        let visible = text
+            .split_once('\0')
+            .map_or(text.as_str(), |(visible, _)| visible);
+        !visible.trim().is_empty()
+    })
+}
+
 /// Convenience function to query an extension from the host.
 ///
 /// # Safety
@@ -3545,3 +3999,11 @@ unsafe fn query_host_extension<T>(
         None
     }
 }
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "wrapper_output_tests.rs"]
+mod clap_output_tests;

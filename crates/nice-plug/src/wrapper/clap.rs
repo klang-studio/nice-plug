@@ -18,6 +18,64 @@ pub use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
 pub use clap_sys::version::CLAP_VERSION;
 use nice_plug_core::context::remote_controls::RemoteControlsContext;
 use nice_plug_core::plugin::Plugin;
+use parking_lot::Mutex;
+use std::sync::Arc;
+
+/// Owns the background workers for as long as this CLAP library is initialized. An instance can
+/// close its task queue during destroy. The final deinit joins the workers before library unload.
+#[doc(hidden)]
+pub struct LibraryWorkers(Mutex<LibraryWorkerState>);
+
+struct LibraryWorkerState {
+    clients: usize,
+    workers: Vec<Arc<dyn Send + Sync>>,
+}
+
+impl LibraryWorkers {
+    pub const fn new() -> Self {
+        Self(Mutex::new(LibraryWorkerState {
+            clients: 0,
+            workers: Vec::new(),
+        }))
+    }
+
+    pub fn initialize(&self) {
+        self.0.lock().clients += 1;
+    }
+
+    pub fn deinitialize(&self) {
+        let workers = {
+            let mut state = self.0.lock();
+            if state.clients == 0 {
+                return;
+            }
+            state.clients -= 1;
+            if state.clients != 0 {
+                return;
+            }
+            std::mem::take(&mut state.workers)
+        };
+        // Dropping the worker handles joins them outside the registry lock.
+        drop(workers);
+    }
+
+    fn retain(&self, worker: Arc<dyn Send + Sync>) {
+        let mut state = self.0.lock();
+        if !state
+            .workers
+            .iter()
+            .any(|current| Arc::ptr_eq(current, &worker))
+        {
+            state.workers.push(worker);
+        }
+    }
+}
+
+impl Default for LibraryWorkers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Provides auxiliary metadata needed for a CLAP plugin.
 #[allow(unused_variables)]
@@ -43,6 +101,17 @@ pub trait ClapPlugin: Plugin {
     /// that the host can use to provide better hardware mapping for a plugin. See the linked
     /// extension for more information.
     fn remote_controls(&self, context: &mut impl RemoteControlsContext) {}
+
+    /// Supplies an optional custom CLAP plugin extension after the wrapper's built-in dispatch.
+    ///
+    /// # Safety
+    ///
+    /// Implementations must be thread-safe and return null for unsupported IDs. Non-null pointers
+    /// must point to immutable extension tables with the C layout and calling convention required
+    /// by the requested ID. A table must remain valid until the plugin instance is destroyed.
+    unsafe fn clap_custom_extension(_id: &std::ffi::CStr) -> *const std::ffi::c_void {
+        std::ptr::null()
+    }
 }
 
 /// Configuration for the plugin's polyphonic modulation options, if it supports .
@@ -66,9 +135,8 @@ macro_rules! nice_export_clap {
         // macros. So instead we'll generate the implementation ad-hoc inside of this macro.
         #[doc(hidden)]
         mod clap {
-            use $crate::prelude::nice_debug_assert_eq;
             use $crate::wrapper::setup_logger;
-            use $crate::wrapper::clap::{PluginDescriptor, Wrapper};
+            use $crate::wrapper::clap::{LibraryWorkers, PluginDescriptor, Wrapper};
             use $crate::wrapper::clap::{CLAP_PLUGIN_FACTORY_ID, clap_host, clap_plugin, clap_plugin_descriptor, clap_plugin_factory};
             use ::std::collections::HashSet;
             use ::std::ffi::{CStr, c_void};
@@ -78,6 +146,8 @@ macro_rules! nice_export_clap {
             // Because the `$plugin_ty`s are likely defined in the enclosing scope. This works even
             // if the types are not public because this is a child module.
             use super::*;
+
+            static LIBRARY_WORKERS: LibraryWorkers = LibraryWorkers::new();
 
             const CLAP_PLUGIN_FACTORY: clap_plugin_factory = clap_plugin_factory {
                 get_plugin_count: Some(get_plugin_count),
@@ -89,23 +159,20 @@ macro_rules! nice_export_clap {
             const PLUGIN_COUNT: usize = [$(stringify!($plugin_ty)),+].len();
 
             // This is a type erased version of the information stored on the plugin types
-            static PLUGIN_DESCRIPTORS: OnceLock<[PluginDescriptor; PLUGIN_COUNT]> = OnceLock::new();
+            static PLUGIN_DESCRIPTORS: OnceLock<Option<[PluginDescriptor; PLUGIN_COUNT]>> =
+                OnceLock::new();
 
-            fn plugin_descriptors() -> &'static [PluginDescriptor; PLUGIN_COUNT] {
+            fn plugin_descriptors() -> &'static [PluginDescriptor] {
                 PLUGIN_DESCRIPTORS.get_or_init(|| {
                     let descriptors = [$(PluginDescriptor::for_plugin::<$plugin_ty>()),+];
-
-                    if cfg!(debug_assertions) {
-                        let unique_plugin_ids: HashSet<_> = descriptors.iter().map(|d| d.clap_id()).collect();
-                        nice_debug_assert_eq!(
-                            unique_plugin_ids.len(),
-                            descriptors.len(),
-                            "Duplicate plugin IDs found in `nice_export_clap!()` call"
-                        );
+                    let mut ids = HashSet::new();
+                    if descriptors.iter().all(|descriptor| ids.insert(descriptor.clap_id())) {
+                        Some(descriptors)
+                    } else {
+                        $crate::nice_error!("Duplicate plugin IDs in nice_export_clap!()");
+                        None
                     }
-
-                    descriptors
-                })
+                }).as_ref().map_or(&[], |descriptors| descriptors.as_slice())
             }
 
             unsafe extern "C" fn get_plugin_count(_factory: *const clap_plugin_factory) -> u32 {
@@ -127,7 +194,7 @@ macro_rules! nice_export_clap {
                 host: *const clap_host,
                 plugin_id: *const c_char,
             ) -> *const clap_plugin  {
-                if plugin_id.is_null() {
+                if plugin_id.is_null() || host.is_null() {
                     return ::std::ptr::null();
                 }
                 let plugin_id_cstr = unsafe { CStr::from_ptr(plugin_id) };
@@ -137,6 +204,9 @@ macro_rules! nice_export_clap {
                 // which is why we do things the way we do. Otherwise we could have used a tuple
                 // instead.
                 let descriptors = plugin_descriptors();
+                if descriptors.is_empty() {
+                    return ::std::ptr::null();
+                }
                 let mut descriptor_idx = 0;
                 $({
                     let descriptor = &descriptors[descriptor_idx];
@@ -144,9 +214,11 @@ macro_rules! nice_export_clap {
                         // Arc does not have a convenient leak function like Box, so this gets a bit awkward
                         // This pointer gets turned into an Arc and its reference count decremented in
                         // [Wrapper::destroy()]
-                        return unsafe {(*Arc::into_raw(Wrapper::<$plugin_ty>::new(host)))
-                            .clap_plugin
-                            .as_ptr()};
+                        let Some(instance) = (unsafe { Wrapper::<$plugin_ty>::new(host) }) else {
+                            return ::std::ptr::null();
+                        };
+                        instance.retain_background_worker(&LIBRARY_WORKERS);
+                        return unsafe { (*Arc::into_raw(instance)).clap_plugin.as_ptr() };
                     }
 
                     descriptor_idx += 1;
@@ -157,13 +229,22 @@ macro_rules! nice_export_clap {
 
             pub extern "C" fn init(_plugin_path: *const c_char) -> bool {
                 $({setup_logger::<$plugin_ty>();})+
+                if plugin_descriptors().is_empty() {
+                    return false;
+                }
+                LIBRARY_WORKERS.initialize();
                 true
             }
 
-            pub extern "C" fn deinit() {}
+            pub extern "C" fn deinit() {
+                LIBRARY_WORKERS.deinitialize();
+            }
 
             pub extern "C" fn get_factory(factory_id: *const c_char) -> *const c_void {
-                if !factory_id.is_null() && unsafe { CStr::from_ptr(factory_id) } == CLAP_PLUGIN_FACTORY_ID {
+                if !factory_id.is_null()
+                    && unsafe { CStr::from_ptr(factory_id) } == CLAP_PLUGIN_FACTORY_ID
+                    && !plugin_descriptors().is_empty()
+                {
                     &CLAP_PLUGIN_FACTORY as *const _ as *const c_void
                 } else {
                     ::std::ptr::null()
@@ -182,4 +263,61 @@ macro_rules! nice_export_clap {
                 get_factory: Some(self::clap::get_factory),
             };
     };
+}
+
+#[cfg(test)]
+mod library_worker_tests {
+    use super::*;
+    use crate::event_loop::{BackgroundThread, MainThreadExecutor};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    type Task = Box<dyn FnOnce() + Send>;
+
+    struct Executor;
+
+    impl MainThreadExecutor<Task> for Executor {
+        fn execute(&self, task: Task, _: bool) {
+            task();
+        }
+    }
+
+    #[test]
+    fn final_deinit_waits_for_the_running_worker() {
+        const WATCHDOG: Duration = Duration::from_secs(10);
+
+        let library = LibraryWorkers::new();
+        library.initialize();
+        let executor = Arc::new(Executor);
+        let worker = BackgroundThread::get_or_create(Arc::downgrade(&executor));
+        let worker_handle = worker.worker_handle();
+        let worker_lifetime = Arc::downgrade(&worker_handle);
+        library.retain(worker_handle);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        assert!(worker.schedule(Box::new(move || {
+            started_tx.send(()).unwrap();
+            finish_rx.recv_timeout(WATCHDOG).unwrap();
+        })));
+        started_rx.recv_timeout(WATCHDOG).unwrap();
+        drop(worker);
+
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let deinit = thread::spawn(move || {
+            library.deinitialize();
+            returned_tx.send(()).unwrap();
+        });
+        let deadline = Instant::now() + WATCHDOG;
+        // A zero count means deinit has dropped the last handle and entered the worker's destructor.
+        while worker_lifetime.strong_count() != 0 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let result_while_blocked = returned_rx.recv_timeout(Duration::from_millis(50));
+        finish_tx.send(()).unwrap();
+        assert_eq!(result_while_blocked, Err(mpsc::RecvTimeoutError::Timeout));
+        returned_rx.recv_timeout(WATCHDOG).unwrap();
+        deinit.join().unwrap();
+    }
 }

@@ -434,20 +434,23 @@ impl EnumParamInner {
         Some(ids[self.unmodulated_plain_value() as usize])
     }
 
+    /// Resolve a serialized stable string identifier to a variant index.
+    pub fn index_from_id(&self, id: &str) -> Option<i32> {
+        self.ids?
+            .iter()
+            .position(|candidate| *candidate == id)
+            .map(|index| index as i32)
+    }
+
     /// Set the parameter based on a serialized stable string identifier. Return whether the ID was
     /// known and the parameter was set.
     pub fn set_from_id(&self, id: &str) -> bool {
-        match self
-            .ids
-            .and_then(|ids| ids.iter().position(|candidate| *candidate == id))
-        {
-            Some(index) => {
-                unsafe {
-                    self._internal_set_plain_value(index as i32);
-                }
-                true
-            }
-            None => false,
+        let Some(index) = self.index_from_id(id) else {
+            return false;
+        };
+        unsafe {
+            self._internal_set_plain_value(index);
         }
+        true
     }
 }
