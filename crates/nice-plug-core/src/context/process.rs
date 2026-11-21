@@ -79,7 +79,7 @@ pub trait ProcessContext<P: Plugin> {
     fn next_event(&mut self) -> Option<PluginNoteEvent<P>>;
 
     /// Try to send an event to the host's output event buffer. Only available when
-    /// [`Plugin::MIDI_OUTPUT`] is set.
+    /// [`Plugin::MIDI_OUTPUT`] is set. CLAP requires events to be sent in nondecreasing sample order.
     fn try_send_event(
         &mut self,
         event: PluginNoteEvent<P>,
@@ -114,6 +114,9 @@ pub enum SendEventError {
     /// The host does not have an output event buffer.
     #[error("Failed to send output event: Host does not have output event buffer")]
     NoOutputBuffer,
+    /// The event precedes an event already sent to the host in this block.
+    #[error("Failed to send output event: Event timing is out of order")]
+    OutOfOrder,
     /// Invalid event type for the plugin's [`Plugin::MIDI_OUTPUT`] configuration.
     #[error(
         "Failed to send output event: Invalid event type for output config {midi_output_config:?}"

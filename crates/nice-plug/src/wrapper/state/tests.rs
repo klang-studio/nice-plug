@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use crate::prelude::{
-    AudioIOLayout, AuxiliaryBuffers, Buffer, Enum, EnumParam, FloatParam, FloatRange,
+    AudioIOLayout, AuxiliaryBuffers, Buffer, Enum, EnumParam, FloatParam, FloatRange, IntParam,
     ProcessContext, ProcessStatus,
 };
 
@@ -17,6 +17,7 @@ enum Mode {
 
 struct StateParams {
     gain: FloatParam,
+    steps: IntParam,
     mode: EnumParam<Mode>,
     secondary: EnumParam<Mode>,
     tertiary: EnumParam<Mode>,
@@ -32,7 +33,20 @@ impl Default for StateParams {
             Arc::new(move |mode| changes.lock().unwrap().push((id, mode)))
         };
         Self {
-            gain: FloatParam::new("Gain", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 }),
+            gain: FloatParam::new(
+                "Gain",
+                0.5,
+                FloatRange::Reversed(&FloatRange::Skewed {
+                    min: 0.0,
+                    max: 1.0,
+                    factor: 2.0,
+                }),
+            ),
+            steps: IntParam::new(
+                "Steps",
+                1,
+                IntRange::Reversed(&IntRange::Linear { min: -2, max: 4 }),
+            ),
             mode: EnumParam::new("Mode", Mode::Off).with_callback(record_change("mode")),
             secondary: EnumParam::new("Secondary mode", Mode::On)
                 .with_callback(record_change("secondary")),
@@ -58,9 +72,10 @@ unsafe impl Params for StateParams {
 }
 
 impl StateParams {
-    fn lookup(&self) -> [(&str, ParamPtr); 4] {
+    fn lookup(&self) -> [(&str, ParamPtr); 5] {
         [
             ("gain", self.gain.as_ptr()),
+            ("steps", self.steps.as_ptr()),
             ("mode", self.mode.as_ptr()),
             ("secondary", self.secondary.as_ptr()),
             ("tertiary", self.tertiary.as_ptr()),
@@ -160,7 +175,7 @@ fn invalid_typed_value_leaves_the_existing_parameters_and_fields_unchanged() {
 }
 
 #[test]
-fn unknown_stable_enum_id_rolls_back_earlier_changes_in_reverse_order() {
+fn unknown_stable_enum_id_never_invokes_value_callbacks() {
     let plugin = StatePlugin::default();
     *plugin.0.remembered.lock().unwrap() = Some("existing".into());
     let json = br#"{"version":"1.0.0","params":{"gain":{"f32":0.25},"mode":{"string":"on"},"secondary":{"string":"off"},"tertiary":{"string":"unknown"}},"fields":{"remembered":"new"}}"#;
@@ -174,20 +189,11 @@ fn unknown_stable_enum_id_rolls_back_earlier_changes_in_reverse_order() {
         *plugin.0.remembered.lock().unwrap(),
         Some("existing".into())
     );
-    assert_eq!(
-        *plugin.0.enum_changes.lock().unwrap(),
-        [
-            ("mode", Mode::On),
-            ("secondary", Mode::Off),
-            ("secondary", Mode::On),
-            ("mode", Mode::Off),
-        ]
-    );
+    assert!(plugin.0.enum_changes.lock().unwrap().is_empty());
 
     state
         .params
         .insert("tertiary".into(), ParamValue::String("on".into()));
-    plugin.0.enum_changes.lock().unwrap().clear();
     assert!(apply(&mut state, &plugin));
     assert_eq!(plugin.0.gain.value(), 0.25);
     assert_eq!(plugin.0.mode.value(), Mode::On);
@@ -201,26 +207,89 @@ fn unknown_stable_enum_id_rolls_back_earlier_changes_in_reverse_order() {
 }
 
 #[test]
-fn state_encoding_and_decoding_share_the_payload_limit() {
+fn enum_restore_updates_the_base_under_modulation_without_repeating_callbacks() {
+    let plugin = StatePlugin::default();
+    let mode = &plugin.0.mode;
+    // SAFETY: This test owns the parameter and no processing is active.
+    assert!(unsafe { mode._internal_modulate_value(1.0) });
+    assert_eq!(mode.value(), Mode::On);
+    assert_eq!(mode.unmodulated_plain_value(), Mode::Off);
+    plugin.0.enum_changes.lock().unwrap().clear();
+
+    let json = br#"{"version":"1.0.0","params":{"mode":{"string":"on"}},"fields":{}}"#;
+    let mut state = deserialize_json_bounded(json, json.len()).unwrap();
+    assert!(apply(&mut state, &plugin));
+    assert_eq!(mode.value(), Mode::On);
+    assert_eq!(mode.unmodulated_plain_value(), Mode::On);
+
+    // SAFETY: This test still owns the parameter and no processing is active.
+    assert!(!unsafe { mode._internal_modulate_value(0.0) });
+    assert_eq!(mode.value(), Mode::On);
+    assert!(plugin.0.enum_changes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn numeric_restore_rejects_invalid_values_and_accepts_both_endpoints() {
+    let plugin = StatePlugin::default();
+    let json = br#"{"version":"1.0.0","params":{"gain":{"f32":0.25},"mode":{"string":"on"},"steps":{"i32":3}},"fields":{"remembered":"new"}}"#;
+    let state = deserialize_json_bounded(json, json.len()).unwrap();
+
+    for (id, value) in [
+        ("gain", ParamValue::F32(-0.25)),
+        ("gain", ParamValue::F32(1.25)),
+        ("gain", ParamValue::F32(f32::INFINITY)),
+        ("gain", ParamValue::F32(f32::NAN)),
+        ("steps", ParamValue::I32(-3)),
+        ("steps", ParamValue::I32(5)),
+    ] {
+        let mut invalid = state.clone();
+        invalid.params.insert(id.into(), value);
+        assert!(!apply(&mut invalid, &plugin));
+        assert_eq!(plugin.0.gain.value(), 0.5);
+        assert_eq!(plugin.0.steps.value(), 1);
+        assert!(plugin.0.enum_changes.lock().unwrap().is_empty());
+        assert!(plugin.0.remembered.lock().unwrap().is_none());
+    }
+
+    for (gain, steps) in [(0.0, -2), (1.0, 4)] {
+        let mut valid = state.clone();
+        valid.params.insert("gain".into(), ParamValue::F32(gain));
+        valid.params.insert("steps".into(), ParamValue::I32(steps));
+        assert!(apply(&mut valid, &plugin));
+        assert_eq!(plugin.0.gain.value(), gain);
+        assert_eq!(plugin.0.steps.value(), steps);
+    }
+}
+
+#[test]
+fn state_encoding_and_decoding_share_the_stored_payload_limit() {
     let state = PluginState {
         version: StatePlugin::VERSION.into(),
         params: BTreeMap::new(),
         fields: [("remembered".into(), "a".repeat(1024))].into(),
     };
     let json = serde_json::to_vec(&state).unwrap();
-    assert!(encode_json(&state, json.len() - 1).is_err());
     assert!(deserialize_json_bounded(&json, json.len() - 1).is_none());
 
     let encoded = encode_json(&state, json.len()).unwrap();
-    let decoded = deserialize_json_bounded(&encoded, json.len()).unwrap();
+    let decoded = deserialize_json_bounded(&encoded, encoded.len()).unwrap();
     assert_eq!(decoded.fields, state.fields);
+    assert!(deserialize_json_bounded(&encoded, encoded.len() - 1).is_none());
+    assert!(encode_json(&state, encoded.len() - 1).is_err());
 
     #[cfg(feature = "zstd")]
     {
-        let limit = json.len() - 1;
-        assert!(encoded.len() < limit);
-        let output = decode_zstd(&encoded, limit - 64).unwrap();
-        assert_eq!(output.len(), limit - 63);
-        assert!(deserialize_json_bounded(&encoded, limit).is_none());
+        // Reproduce the legacy compressor and exercise the same expansion as a large CLAP
+        // state record with a smaller cap.
+        let legacy = zstd::encode_all(json.as_slice(), zstd::DEFAULT_COMPRESSION_LEVEL).unwrap();
+        assert!(legacy.len() < json.len());
+        let decoded = deserialize_json_bounded(&legacy, legacy.len()).unwrap();
+        assert_eq!(decoded.fields, state.fields);
+
+        let truncated = &legacy[..legacy.len() - 1];
+        assert!(deserialize_json_bounded(truncated, legacy.len()).is_none());
+        let mut corrupted = legacy;
+        corrupted.extend_from_slice(b"trailing garbage");
+        assert!(deserialize_json_bounded(&corrupted, corrupted.len()).is_none());
     }
 }

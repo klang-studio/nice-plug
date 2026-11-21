@@ -84,7 +84,7 @@ impl<P: ClapPlugin> ActivateContext<P> for WrapperActivateContext<'_, P> {
     }
 
     fn execute(&self, task: P::BackgroundTask) {
-        (self.wrapper.task_executor.lock())(task);
+        self.wrapper.execute_plugin_task(task);
     }
 
     fn set_latency_samples(&self, samples: u32) {
@@ -140,13 +140,16 @@ impl<P: ClapPlugin> ProcessContext<P> for WrapperProcessContext<'_, P> {
             return Err((event, SendEventError::NoOutputBuffer));
         }
 
-        // CLAP outputs are streaming and sorted. Keep notes inside this slice and never
-        // append a timestamp earlier than the one last accepted by the host.
-        let time = event
-            .timing()
-            .saturating_add(self.current_sample_idx)
-            .min(self.end_sample_idx.saturating_sub(1))
-            .max(self.last_output_time);
+        // CLAP outputs are streaming and sorted. Clamp notes to the slice boundary,
+        // but preserve the timing of events within the slice.
+        let time = event.timing().saturating_add(self.current_sample_idx).min(
+            self.end_sample_idx
+                .saturating_sub(1)
+                .max(self.current_sample_idx),
+        );
+        if time < self.last_output_time {
+            return Err((event, SendEventError::OutOfOrder));
+        }
 
         fn voice_to_i32(voice_id: VoiceID) -> i32 {
             voice_id.id().unwrap_or(-1)

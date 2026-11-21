@@ -1,6 +1,8 @@
 use std::cell::Cell;
 use std::ptr;
 
+use nice_plug_core::context::process::SendEventError;
+
 use crate::prelude::*;
 
 use super::*;
@@ -30,7 +32,7 @@ unsafe impl Params for ProbeParams {
 }
 
 thread_local! {
-    static OBSERVED_GAIN: Cell<Option<f32>> = const { Cell::new(None) };
+    static OBSERVED_GAINS: Cell<(Option<f32>, Option<f32>)> = const { Cell::new((None, None)) };
 }
 
 #[derive(Default)]
@@ -60,18 +62,24 @@ impl Plugin for QueueProbe {
         _: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        OBSERVED_GAIN.set(Some(self.params.gain.value()));
-        assert!(
-            context
-                .try_send_event(NoteEvent::NoteOn {
-                    timing: 5,
-                    voice_id: VoiceID::Wildcard,
-                    channel: Channel::Number(0),
-                    key: Key::Number(60),
-                    velocity: 1.0,
-                })
-                .is_ok()
-        );
+        let gain = Some(self.params.gain.value());
+        let (first, _) = OBSERVED_GAINS.get();
+        OBSERVED_GAINS.set(first.map_or((gain, None), |first| (Some(first), gain)));
+        let note = |timing| NoteEvent::NoteOn {
+            timing,
+            voice_id: VoiceID::Wildcard,
+            channel: Channel::Number(0),
+            key: Key::Number(60),
+            velocity: 1.0,
+        };
+        assert!(context.try_send_event(note(5)).is_ok());
+        assert!(matches!(
+            context.try_send_event(note(2)),
+            Err((
+                NoteEvent::NoteOn { timing: 2, .. },
+                SendEventError::OutOfOrder
+            ))
+        ));
         ProcessStatus::Normal
     }
 }
@@ -168,6 +176,21 @@ fn rejected_parameter_event_keeps_its_fifo_position_until_accepted() {
 
 #[test]
 fn parameter_output_precedes_notes_without_applying_the_dsp_value_early() {
+    unsafe extern "C" fn input_size(_: *const clap_input_events) -> u32 {
+        1
+    }
+
+    unsafe extern "C" fn input_get(
+        input: *const clap_input_events,
+        index: u32,
+    ) -> *const clap_event_header {
+        if index == 0 {
+            unsafe { (*input).ctx.cast() }
+        } else {
+            ptr::null()
+        }
+    }
+
     let host = clap_host {
         clap_version: clap_sys::version::CLAP_VERSION,
         host_data: ptr::null_mut(),
@@ -198,6 +221,33 @@ fn parameter_output_precedes_notes_without_applying_the_dsp_value_early() {
         ctx: ptr::from_mut(&mut output).cast(),
         try_push: Some(try_push),
     };
+    let mut transport = clap_event_transport {
+        header: clap_event_header {
+            size: mem::size_of::<clap_event_transport>() as u32,
+            time: 8,
+            space_id: CLAP_CORE_EVENT_SPACE_ID,
+            type_: CLAP_EVENT_TRANSPORT,
+            flags: 0,
+        },
+        flags: 0,
+        song_pos_beats: 0,
+        song_pos_seconds: 0,
+        tempo: 0.0,
+        tempo_inc: 0.0,
+        loop_start_beats: 0,
+        loop_end_beats: 0,
+        loop_start_seconds: 0,
+        loop_end_seconds: 0,
+        bar_start: 0,
+        bar_number: 0,
+        tsig_num: 0,
+        tsig_denom: 0,
+    };
+    let inputs = clap_input_events {
+        ctx: ptr::from_mut(&mut transport).cast(),
+        size: Some(input_size),
+        get: Some(input_get),
+    };
     let process = clap_process {
         steady_time: 0,
         frames_count: 16,
@@ -206,9 +256,10 @@ fn parameter_output_precedes_notes_without_applying_the_dsp_value_early() {
         audio_outputs: ptr::null_mut(),
         audio_inputs_count: 0,
         audio_outputs_count: 0,
-        in_events: ptr::null(),
+        in_events: &inputs,
         out_events: &callbacks,
     };
+    OBSERVED_GAINS.set((None, None));
     assert_ne!(
         unsafe { Wrapper::<QueueProbe>::process(plugin, &process) },
         CLAP_PROCESS_ERROR
@@ -219,9 +270,13 @@ fn parameter_output_precedes_notes_without_applying_the_dsp_value_early() {
     }
     assert_eq!(
         output.events,
-        [(0, CLAP_EVENT_PARAM_VALUE), (5, CLAP_EVENT_NOTE_ON)]
+        [
+            (0, CLAP_EVENT_PARAM_VALUE),
+            (5, CLAP_EVENT_NOTE_ON),
+            (13, CLAP_EVENT_NOTE_ON),
+        ]
     );
-    assert_eq!(OBSERVED_GAIN.get(), Some(0.375));
+    assert_eq!(OBSERVED_GAINS.get(), (Some(0.375), Some(0.75)));
     let mut value = 0.0;
     assert!(unsafe { Wrapper::<QueueProbe>::ext_params_get_value(plugin, id, &mut value) });
     assert_eq!(value, 0.75);

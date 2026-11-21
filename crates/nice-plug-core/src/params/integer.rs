@@ -186,25 +186,22 @@ impl InternalParamMut for IntParam {
             (self.preview_plain(normalized_value), normalized_value)
         };
 
-        // REAPER spams automation events with the same value. This prevents callbacks from firing
-        // multiple times. This can be problematic when they're used to trigger expensive
-        // computations when a parameter changes.
+        // A base value can change while rounding or clamping keeps the modulated value fixed.
+        // Retain the new base so saving state or removing modulation uses the latest value.
         let old_value = self.value.swap(value, Ordering::Relaxed);
-        if value != old_value {
-            self.normalized_value
-                .store(normalized_value, Ordering::Relaxed);
-            self.unmodulated_value
-                .store(unmodulated_value, Ordering::Relaxed);
-            self.unmodulated_normalized_value
-                .store(unmodulated_normalized_value, Ordering::Relaxed);
-            if let Some(f) = &self.value_changed {
-                f(value);
-            }
+        self.normalized_value
+            .store(normalized_value, Ordering::Relaxed);
+        self.unmodulated_value
+            .store(unmodulated_value, Ordering::Relaxed);
+        self.unmodulated_normalized_value
+            .store(unmodulated_normalized_value, Ordering::Relaxed);
 
-            true
-        } else {
-            false
+        // Repeated automation must not trigger expensive callbacks for the same effective value.
+        let changed = value != old_value;
+        if changed && let Some(f) = &self.value_changed {
+            f(value);
         }
+        changed
     }
 
     unsafe fn _internal_set_normalized_value(&self, normalized: f32) -> bool {

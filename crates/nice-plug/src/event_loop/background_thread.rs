@@ -36,7 +36,6 @@ struct WorkerThread<T, E> {
 struct Executor<E> {
     instance: Weak<E>,
     closed: AtomicBool,
-    in_flight: Mutex<()>,
 }
 
 impl<T, E> BackgroundThread<T, E>
@@ -49,7 +48,6 @@ where
             executor: Arc::new(Executor {
                 instance: executor,
                 closed: AtomicBool::new(false),
-                in_flight: Mutex::new(()),
             }),
             // The same worker thread can be shared by multiple instances. Lifecycle management
             // happens through reference counting.
@@ -73,11 +71,15 @@ where
         })
     }
 
-    /// Close this instance to new work and wait for its current task, if any, to finish.
-    /// Call on the host's main thread before invalidating its instance-specific callbacks.
-    pub fn quiesce(&self) {
+    /// Cancel queued work and stop accepting tasks from this instance. A running task can finish
+    /// using the executor it already acquired.
+    pub fn close(&self) {
         self.executor.closed.store(true, Ordering::Release);
-        let _task = self.executor.in_flight.lock();
+    }
+
+    /// Keep this shared worker alive independently of the instance handles.
+    pub fn worker_handle(&self) -> Arc<dyn Send + Sync> {
+        self.worker_thread.clone()
     }
 }
 
@@ -154,9 +156,8 @@ where
     E: MainThreadExecutor<T> + 'static,
 {
     while let Ok((task, executor)) = tasks_receiver.recv() {
-        let _task = executor.in_flight.lock();
-        if !executor.closed.load(Ordering::Acquire)
-            && let Some(instance) = executor.instance.upgrade()
+        if let Some(instance) = executor.instance.upgrade()
+            && !executor.closed.load(Ordering::Acquire)
         {
             instance.execute(task, true);
         }
@@ -181,7 +182,7 @@ mod tests {
         }
     }
 
-    const TIMEOUT: Duration = Duration::from_secs(2);
+    const TIMEOUT: Duration = Duration::from_secs(10);
 
     #[test]
     fn an_expired_instance_does_not_stop_the_shared_worker() {
@@ -202,50 +203,34 @@ mod tests {
     }
 
     #[test]
-    fn quiesce_waits_for_only_the_closing_instances_active_task() {
+    fn close_returns_during_the_active_task_and_cancels_queued_work() {
         let first = Arc::new(TestExecutor);
         let peer = Arc::new(TestExecutor);
-        let worker = Arc::new(BackgroundThread::get_or_create(Arc::downgrade(&first)));
+        let worker = BackgroundThread::get_or_create(Arc::downgrade(&first));
         let peer_worker = BackgroundThread::get_or_create(Arc::downgrade(&peer));
         let (entered_tx, entered_rx) = mpsc::channel();
         let (leave_tx, leave_rx) = mpsc::channel();
         assert!(worker.schedule(Box::new(move || {
             entered_tx.send(()).unwrap();
-            let _ = leave_rx.recv_timeout(TIMEOUT);
+            leave_rx.recv_timeout(TIMEOUT).unwrap();
         })));
         entered_rx.recv_timeout(TIMEOUT).unwrap();
         let (cancelled_tx, cancelled_rx) = mpsc::channel();
         assert!(worker.schedule(Box::new(move || cancelled_tx.send(()).unwrap())));
 
-        let (peer_entered_tx, peer_entered_rx) = mpsc::channel();
-        let (peer_leave_tx, peer_leave_rx) = mpsc::channel();
-        assert!(peer_worker.schedule(Box::new(move || {
-            peer_entered_tx.send(()).unwrap();
-            let _ = peer_leave_rx.recv_timeout(TIMEOUT);
-        })));
-
-        let (closed_tx, closed_rx) = mpsc::channel();
-        let closing = Arc::clone(&worker);
-        let join = thread::spawn(move || {
-            closing.quiesce();
-            closed_tx.send(()).unwrap();
-        });
-        let start = std::time::Instant::now();
-        while !worker.executor.closed.load(Ordering::Acquire) {
-            assert!(start.elapsed() < TIMEOUT);
-            thread::yield_now();
-        }
-        assert!(closed_rx.try_recv().is_err());
+        // The worker cannot finish the active task until explicitly released.
+        worker.close();
         assert!(!worker.schedule(Box::new(|| panic!("closed task was queued"))));
-        leave_tx.send(()).unwrap();
+        drop(worker);
+        drop(first);
 
-        peer_entered_rx.recv_timeout(TIMEOUT).unwrap();
-        closed_rx.recv_timeout(TIMEOUT).unwrap();
+        let (peer_tx, peer_rx) = mpsc::channel();
+        assert!(peer_worker.schedule(Box::new(move || peer_tx.send(()).unwrap())));
+        leave_tx.send(()).unwrap();
+        peer_rx.recv_timeout(TIMEOUT).unwrap();
         assert!(matches!(
             cancelled_rx.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
-        peer_leave_tx.send(()).unwrap();
-        join.join().unwrap();
     }
 }

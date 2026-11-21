@@ -79,6 +79,8 @@ use nice_plug_core::plugin::{Plugin, PluginState, ProcessStatus, TaskExecutor};
 use nice_plug_core::plugin::{TrackColor, TrackInfo};
 use parking_lot::Mutex;
 #[cfg(feature = "editor")]
+use parking_lot::RwLock;
+#[cfg(feature = "editor")]
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, c_void};
@@ -97,11 +99,11 @@ use super::descriptor::PluginDescriptor;
 use super::util::ClapPtr;
 use crate::event_loop::{BackgroundThread, EventLoop, MainThreadExecutor, TASK_QUEUE_CAPACITY};
 use crate::util::permit_alloc;
-use crate::wrapper::clap::ClapPlugin;
 use crate::wrapper::clap::context::RemoteControlPages;
 #[cfg(feature = "editor")]
 use crate::wrapper::clap::context::WrapperGuiContext;
 use crate::wrapper::clap::util::{read_state_record, write_state_record};
+use crate::wrapper::clap::{ClapPlugin, LibraryWorkers};
 use crate::wrapper::state::{self};
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 use crate::wrapper::util::{clamp_input_event_timing, hash_param_id, process_wrapper, strlcpy};
@@ -123,6 +125,44 @@ struct DeferredParameter {
     note_id: i32,
     value: f64,
     event_type: u16,
+    revision: u64,
+}
+
+impl DeferredParameter {
+    /// If non-null, the pointer must be valid for the original host event's advertised size.
+    unsafe fn from_event(event: *const clap_event_header, revision: u64) -> Option<Self> {
+        let header = unsafe { event.as_ref() }?;
+        if header.space_id != CLAP_CORE_EVENT_SPACE_ID {
+            return None;
+        }
+        let size = header.size as usize;
+        let (param_id, note_id, value) = match header.type_ {
+            CLAP_EVENT_PARAM_VALUE if size >= mem::size_of::<clap_event_param_value>() => {
+                let event = unsafe { &*event.cast::<clap_event_param_value>() };
+                (event.param_id, event.note_id, event.value)
+            }
+            CLAP_EVENT_PARAM_MOD if size >= mem::size_of::<clap_event_param_mod>() => {
+                let event = unsafe { &*event.cast::<clap_event_param_mod>() };
+                (event.param_id, event.note_id, event.amount)
+            }
+            _ => return None,
+        };
+        Some(Self {
+            param_id,
+            note_id,
+            value,
+            event_type: header.type_,
+            revision,
+        })
+    }
+}
+
+/// A restore supersedes host values from before its request and plugin output queued
+/// before it completed. Each cutoff applies only to parameters that the restore changed.
+#[derive(Default)]
+struct RestoredParameterRevisions {
+    incoming: AtomicU64,
+    outgoing: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -156,20 +196,37 @@ impl StateAccess {
         (!self.control_pending.load(Ordering::Acquire)).then_some(guard)
     }
 
-    fn with_control<T>(&self, timeout: Duration, apply: impl FnOnce() -> T) -> Option<T> {
-        self.control_pending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()?;
-        let _request = StateRequest(&self.control_pending);
+    /// A bounded control request fails if another control operation has already reserved access.
+    /// Editor restores pass no timeout so the value is available when the GUI call returns.
+    fn with_control<T>(&self, timeout: Option<Duration>, apply: impl FnOnce() -> T) -> Option<T> {
+        const POLL_INTERVAL: Duration = Duration::from_millis(1);
+        let _request = loop {
+            if self
+                .control_pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break StateRequest(&self.control_pending);
+            }
+            if timeout.is_some() {
+                return None;
+            }
+            thread::sleep(POLL_INTERVAL);
+        };
         let started = Instant::now();
         loop {
             if let Some(_gate) = self.gate.try_lock() {
                 return Some(apply());
             }
-            let remaining = timeout.checked_sub(started.elapsed())?;
-            thread::sleep(remaining.min(Duration::from_millis(1)));
-            if started.elapsed() >= timeout {
-                return None;
+
+            if let Some(timeout) = timeout {
+                let remaining = timeout.checked_sub(started.elapsed())?;
+                thread::sleep(remaining.min(POLL_INTERVAL));
+                if started.elapsed() >= timeout {
+                    return None;
+                }
+            } else {
+                thread::sleep(POLL_INTERVAL);
             }
         }
     }
@@ -228,6 +285,34 @@ unsafe fn clear_channels<T>(channels: *mut *mut T, count: usize, frames: usize) 
     }
 }
 
+fn advance_transport_bar(
+    transport: &mut Transport,
+    context: &clap_event_transport,
+    elapsed_samples: usize,
+) {
+    let bar_start = context.bar_start as f64 / CLAP_BEATTIME_FACTOR as f64;
+    transport.bar_start_pos_beats = Some(bar_start);
+    transport.bar_number = Some(context.bar_number);
+    // Past time signature changes can shift the grid away from beat zero.
+    if transport.playing
+        && elapsed_samples > 0
+        && let (Some(beats), Some(numerator), Some(denominator)) = (
+            transport.pos_beats,
+            transport.time_sig_numerator,
+            transport.time_sig_denominator,
+        )
+        && numerator > 0
+        && denominator > 0
+    {
+        let bar_length = f64::from(numerator) * 4.0 / f64::from(denominator);
+        let bars_elapsed = ((beats - bar_start) / bar_length).floor();
+        if bars_elapsed.is_finite() && bars_elapsed > 0.0 {
+            transport.bar_start_pos_beats = Some(bar_start + bars_elapsed * bar_length);
+            transport.bar_number = Some((f64::from(context.bar_number) + bars_elapsed) as i32);
+        }
+    }
+}
+
 pub struct Wrapper<P: ClapPlugin> {
     /// A reference to this object, upgraded to an `Arc<Self>` for the GUI context.
     this: AtomicRefCell<Weak<Self>>,
@@ -235,7 +320,7 @@ pub struct Wrapper<P: ClapPlugin> {
     /// The wrapped plugin instance.
     plugin: TryLock<P>,
     /// The plugin's background task executor closure.
-    pub task_executor: Mutex<TaskExecutor<P>>,
+    task_executor: Arc<BackgroundTaskExecutor<P>>,
     /// The plugin's parameters. These are fetched once during initialization. That way the
     /// `ParamPtr`s are guaranteed to live at least as long as this object and we can interact with
     /// the `Params` object without having to acquire a lock on `plugin`.
@@ -289,10 +374,7 @@ pub struct Wrapper<P: ClapPlugin> {
     deferred_releases: ArrayQueue<DeferredRelease>,
     reconcile_voices: AtomicBool,
     revision: AtomicU64,
-    latest_restored_state: AtomicU64,
-    restored_parameter_revisions: HashMap<u32, AtomicU64>,
-    #[cfg(feature = "editor")]
-    pending_editor_state: Mutex<Option<(u64, PluginState)>>,
+    restored_parameter_revisions: HashMap<u32, RestoredParameterRevisions>,
 
     // We'll query all of the host's extensions upfront
     host_callback: ClapPtr<clap_host>,
@@ -405,9 +487,20 @@ pub struct Wrapper<P: ClapPlugin> {
     /// [`host_thread_check`][Self::host_thread_check] thus contains a value), then that extension
     /// is used instead.
     main_thread_id: ThreadId,
-    /// A background thread for running tasks independently from the host'main GUI thread. Useful
-    /// for longer, blocking tasks. Initialized later as it needs a reference to the wrapper.
-    background_thread: AtomicRefCell<Option<BackgroundThread<Task<P>, Self>>>,
+    /// The worker owns the task executor independently of the host-facing wrapper.
+    background_thread: BackgroundThread<P::BackgroundTask, BackgroundTaskExecutor<P>>,
+    /// Guards editor task submission across instance teardown. Background tasks may hold a clone
+    /// of the async executor, but only submission holds this guard.
+    #[cfg(feature = "editor")]
+    editor_tasks_open: Arc<RwLock<bool>>,
+}
+
+struct BackgroundTaskExecutor<P: Plugin>(Mutex<TaskExecutor<P>>);
+
+impl<P: Plugin> MainThreadExecutor<P::BackgroundTask> for BackgroundTaskExecutor<P> {
+    fn execute(&self, task: P::BackgroundTask, _: bool) {
+        (self.0.lock())(task);
+    }
 }
 
 /// Tasks that can be sent from the plugin to be executed on the main thread in a non-blocking
@@ -485,11 +578,10 @@ impl<P: ClapPlugin> EventLoop<Task<P>, Wrapper<P>> for Wrapper<P> {
     }
 
     fn schedule_background(&self, task: Task<P>) -> bool {
-        self.background_thread
-            .borrow()
-            .as_ref()
-            .unwrap()
-            .schedule(task)
+        let Task::PluginTask(task) = task else {
+            unreachable!("only plugin tasks run on the background worker");
+        };
+        self.background_thread.schedule(task)
     }
 
     fn is_main_thread(&self) -> bool {
@@ -510,7 +602,7 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
     fn execute(&self, task: Task<P>, is_gui_thread: bool) {
         // This function is always called from the main thread, from [Self::on_main_thread].
         match task {
-            Task::PluginTask(task) => (self.task_executor.lock())(task),
+            Task::PluginTask(task) => self.execute_plugin_task(task),
             #[cfg(feature = "editor")]
             Task::ParameterValueChanged(param_hash, normalized_value) => {
                 use nice_plug_core::editor::EditorHandle;
@@ -571,7 +663,7 @@ impl<P: ClapPlugin> Wrapper<P> {
     /// `host_callback` needs to outlive the returned object.
     pub unsafe fn new(host_callback: *const clap_host) -> Option<Arc<Self>> {
         let mut plugin = P::default();
-        let task_executor = Mutex::new(plugin.task_executor());
+        let task_executor = Arc::new(BackgroundTaskExecutor(Mutex::new(plugin.task_executor())));
 
         let plugin_descriptor: Box<PluginDescriptor> =
             Box::new(PluginDescriptor::for_plugin::<P>());
@@ -675,6 +767,8 @@ impl<P: ClapPlugin> Wrapper<P> {
             &param_ptr_to_hash,
         );
 
+        let background_thread = BackgroundThread::get_or_create(Arc::downgrade(&task_executor));
+
         let wrapper = Self {
             this: AtomicRefCell::new(Weak::new()),
 
@@ -713,13 +807,10 @@ impl<P: ClapPlugin> Wrapper<P> {
             deferred_releases: ArrayQueue::new(DEFERRED_EVENT_QUEUE_CAPACITY),
             reconcile_voices: AtomicBool::new(false),
             revision: AtomicU64::new(1),
-            latest_restored_state: AtomicU64::new(0),
             restored_parameter_revisions: param_by_hash
                 .keys()
-                .map(|hash| (*hash, AtomicU64::new(0)))
+                .map(|hash| (*hash, RestoredParameterRevisions::default()))
                 .collect(),
-            #[cfg(feature = "editor")]
-            pending_editor_state: Mutex::new(None),
 
             host_callback,
 
@@ -859,8 +950,9 @@ impl<P: ClapPlugin> Wrapper<P> {
 
             tasks: ArrayQueue::new(TASK_QUEUE_CAPACITY),
             main_thread_id: thread::current().id(),
-            // Initialized later as it needs a reference to the wrapper for the executor
-            background_thread: AtomicRefCell::new(None),
+            background_thread,
+            #[cfg(feature = "editor")]
+            editor_tasks_open: Arc::new(RwLock::new(true)),
         };
 
         // Finally, the wrapper needs to contain a reference to itself so we can create GuiContexts
@@ -872,10 +964,6 @@ impl<P: ClapPlugin> Wrapper<P> {
         // from the vtable functions
         wrapper.clap_plugin.borrow_mut().plugin_data = Arc::as_ptr(&wrapper) as *mut _;
 
-        // Initialize the background thread **before** the editor!
-        *wrapper.background_thread.borrow_mut() =
-            Some(BackgroundThread::get_or_create(Arc::downgrade(&wrapper)));
-
         // The editor also needs to be initialized later so the Async executor can work.
         #[cfg(feature = "editor")]
         {
@@ -885,8 +973,15 @@ impl<P: ClapPlugin> Wrapper<P> {
                 .unwrap()
                 .editor(nice_plug_core::context::gui::AsyncExecutor::new(
                     Arc::new({
+                        let tasks_open = Arc::clone(&wrapper.editor_tasks_open);
                         let wrapper = Arc::downgrade(&wrapper);
                         move |task| {
+                            let Some(is_open) = tasks_open.try_read() else {
+                                return;
+                            };
+                            if !*is_open {
+                                return;
+                            }
                             let wrapper = match wrapper.upgrade() {
                                 Some(wrapper) => wrapper,
                                 None => return,
@@ -900,8 +995,15 @@ impl<P: ClapPlugin> Wrapper<P> {
                         }
                     }),
                     Arc::new({
+                        let tasks_open = Arc::clone(&wrapper.editor_tasks_open);
                         let wrapper = Arc::downgrade(&wrapper);
                         move |task| {
+                            let Some(is_open) = tasks_open.try_read() else {
+                                return;
+                            };
+                            if !*is_open {
+                                return;
+                            }
                             let wrapper = match wrapper.upgrade() {
                                 Some(wrapper) => wrapper,
                                 None => return,
@@ -919,6 +1021,15 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
 
         Some(wrapper)
+    }
+
+    #[doc(hidden)]
+    pub fn retain_background_worker(&self, workers: &LibraryWorkers) {
+        workers.retain(self.background_thread.worker_handle());
+    }
+
+    pub(super) fn execute_plugin_task(&self, task: P::BackgroundTask) {
+        self.task_executor.execute(task, false);
     }
 
     #[cfg(feature = "editor")]
@@ -1092,39 +1203,36 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
     }
 
-    /// Handle all incoming events from an event queue. This will clear `self.input_events` first.
+    /// Apply flushed parameter changes. Only process can deliver per-note modulation to DSP.
     ///
     /// # Safety
     ///
-    /// `in_` must contain only pointers to valid data (Clippy insists on there being a safety
-    /// section here).
-    pub unsafe fn handle_in_events(
-        &self,
-        in_: Option<&clap_input_events>,
-        current_sample_idx: usize,
-        total_buffer_len: usize,
-    ) {
+    /// `in_` must contain only pointers to valid data.
+    unsafe fn handle_flush_events(&self, in_: Option<&clap_input_events>) {
         let mut input_events = self.input_events.borrow_mut();
         input_events.clear();
-        self.replay_parameters(&mut input_events, total_buffer_len);
+        self.replay_parameters(&mut input_events, 0, false);
         let Some(in_) = in_ else { return };
 
         unsafe {
             let num_events = clap_call! { in_=>size(in_) };
             for event_idx in 0..num_events {
                 let event = clap_call! { in_=>get(in_, event_idx) };
-                self.handle_input_event(
-                    event,
-                    &mut input_events,
-                    None,
-                    current_sample_idx,
-                    total_buffer_len,
-                );
+                let Some(header) = event.as_ref() else {
+                    continue;
+                };
+                if let Some(parameter) = DeferredParameter::from_event(header, 0)
+                    && self.is_per_note_modulation(parameter)
+                {
+                    self.deferred_parameters.force_push(parameter);
+                } else {
+                    self.handle_input_event(event, &mut input_events, None, 0, 0);
+                }
             }
         }
     }
 
-    /// Similar to [`handle_in_events()`][Self::handle_in_events()], but will stop just before an
+    /// Handle incoming events from the host, stopping just before an
     /// event if the predicate returns true for that events. This predicate is only called for
     /// events that occur after `current_sample_idx`. This is used to stop before a tempo or time
     /// signature change, or before next parameter change event with `raw_event.time >
@@ -1150,7 +1258,7 @@ impl<P: ClapPlugin> Wrapper<P> {
         let mut input_events = self.input_events.borrow_mut();
         input_events.clear();
         if current_sample_idx == 0 {
-            self.replay_parameters(&mut input_events, total_buffer_len);
+            self.replay_parameters(&mut input_events, total_buffer_len, true);
             for _ in 0..DEFERRED_EVENT_QUEUE_CAPACITY {
                 let Some(event) = self.deferred_releases.pop() else {
                     break;
@@ -1208,6 +1316,7 @@ impl<P: ClapPlugin> Wrapper<P> {
         let Some(in_) = (unsafe { in_.as_ref() }) else {
             return;
         };
+        let revision = self.next_revision();
         let count = unsafe {
             clap_call! { in_=>size(in_) }
         };
@@ -1222,28 +1331,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                 continue;
             }
             let size = header.size as usize;
-            let parameter = match header.type_ {
-                CLAP_EVENT_PARAM_VALUE if size >= mem::size_of::<clap_event_param_value>() => {
-                    let event = unsafe { &*event.cast::<clap_event_param_value>() };
-                    Some(DeferredParameter {
-                        param_id: event.param_id,
-                        note_id: event.note_id,
-                        value: event.value,
-                        event_type: header.type_,
-                    })
-                }
-                CLAP_EVENT_PARAM_MOD if size >= mem::size_of::<clap_event_param_mod>() => {
-                    let event = unsafe { &*event.cast::<clap_event_param_mod>() };
-                    Some(DeferredParameter {
-                        param_id: event.param_id,
-                        note_id: event.note_id,
-                        value: event.amount,
-                        event_type: header.type_,
-                    })
-                }
-                _ => None,
-            };
-            if let Some(parameter) = parameter {
+            if let Some(parameter) = unsafe { DeferredParameter::from_event(event, revision) } {
                 // If the host exceeds the backlog, retain its newest parameter updates.
                 self.deferred_parameters.force_push(parameter);
             }
@@ -1263,8 +1351,10 @@ impl<P: ClapPlugin> Wrapper<P> {
                     let mut midi = unsafe { *event.cast::<clap_event_midi>() };
                     let status = midi.data[0] & 0xf0;
                     let note_off = status == 0x80 || (status == 0x90 && midi.data[2] == 0);
-                    let all_notes_off = status == 0xb0 && matches!(midi.data[1], 120 | 123..=127);
-                    if !note_off && !(P::MIDI_INPUT >= MidiConfig::MidiCCs && all_notes_off) {
+                    let release_cc = status == 0xb0
+                        && (matches!(midi.data[1], 120 | 123..=127)
+                            || (midi.data[1] == 64 && midi.data[2] < 64));
+                    if !note_off && !(P::MIDI_INPUT >= MidiConfig::MidiCCs && release_cc) {
                         continue;
                     }
                     midi.header.time = 0;
@@ -1290,21 +1380,44 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
     }
 
+    fn is_per_note_modulation(&self, parameter: DeferredParameter) -> bool {
+        parameter.event_type == CLAP_EVENT_PARAM_MOD
+            && parameter.note_id != -1
+            && P::MIDI_INPUT >= MidiConfig::Basic
+            && self.poly_mod_ids_by_hash.contains_key(&parameter.param_id)
+    }
+
     fn replay_parameters(
         &self,
         input_events: &mut AtomicRefMut<VecDeque<PluginNoteEvent<P>>>,
         total_buffer_len: usize,
+        deliver_note_events: bool,
     ) {
-        for _ in 0..DEFERRED_EVENT_QUEUE_CAPACITY {
+        // CLAP excludes concurrent process and flush calls. Rotate existing per-note modulation
+        // to the back during a flush, preserving its order for the next process block.
+        for _ in 0..self.deferred_parameters.len() {
             let Some(parameter) = self.deferred_parameters.pop() else {
                 break;
             };
+            if !deliver_note_events && self.is_per_note_modulation(parameter) {
+                self.deferred_parameters.force_push(parameter);
+                continue;
+            }
             let DeferredParameter {
                 param_id,
                 note_id,
                 value,
                 event_type,
+                revision,
             } = parameter;
+            if event_type == CLAP_EVENT_PARAM_VALUE
+                && self
+                    .restored_parameter_revisions
+                    .get(&param_id)
+                    .is_some_and(|cutoff| revision < cutoff.incoming.load(Ordering::Relaxed))
+            {
+                continue;
+            }
             let header = |size: usize| clap_event_header {
                 size: size as u32,
                 time: 0,
@@ -1368,7 +1481,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                 && self
                     .restored_parameter_revisions
                     .get(&param_hash)
-                    .is_some_and(|revision| queued.revision < revision.load(Ordering::Relaxed))
+                    .is_some_and(|cutoff| queued.revision < cutoff.outgoing.load(Ordering::Relaxed))
             {
                 // Preserve the gesture boundaries and any unrelated or later values.
                 continue;
@@ -1794,30 +1907,10 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
     }
 
-    /// Restore a preset on the editor thread. Audio processing is excluded while applying it.
+    /// Restore a preset before returning to the editor, even during a long offline process call.
     #[cfg(feature = "editor")]
-    pub fn set_state_object_from_gui(&self, state: PluginState) {
-        self.apply_or_queue_editor_state(self.next_revision(), state, STATE_ACCESS_TIMEOUT);
-    }
-
-    #[cfg(feature = "editor")]
-    fn apply_or_queue_editor_state(
-        &self,
-        revision: u64,
-        mut state: PluginState,
-        timeout: Duration,
-    ) {
-        if self.try_set_state(&mut state, revision, timeout).is_none() {
-            let mut pending = self.pending_editor_state.lock();
-            if pending
-                .as_ref()
-                .is_none_or(|(queued, _)| *queued < revision)
-            {
-                *pending = Some((revision, state));
-            }
-            drop(pending);
-            self.request_main_callback();
-        }
+    pub fn set_state_object_from_gui(&self, mut state: PluginState) {
+        self.try_set_state(&mut state, None);
     }
 
     pub fn set_latency_samples(&self, samples: u32) {
@@ -1914,24 +2007,17 @@ impl<P: ClapPlugin> Wrapper<P> {
 
     /// Apply state on a non-audio thread, waiting briefly for an in-flight block or flush.
     pub fn set_state_inner(&self, state: &mut PluginState) -> bool {
-        self.try_set_state(state, self.next_revision(), STATE_ACCESS_TIMEOUT)
+        self.try_set_state(state, Some(STATE_ACCESS_TIMEOUT))
             .unwrap_or_else(|| {
                 crate::nice_warn!("Could not acquire exclusive access to restore plugin state");
                 false
             })
     }
 
-    /// None means the request was busy. Some(false) means there is nothing to retry.
-    fn try_set_state(
-        &self,
-        state: &mut PluginState,
-        revision: u64,
-        timeout: Duration,
-    ) -> Option<bool> {
+    /// None means the gate was busy. Some(false) means the state failed validation.
+    fn try_set_state(&self, state: &mut PluginState, timeout: Option<Duration>) -> Option<bool> {
+        let revision = self.next_revision();
         let result = self.state_access.with_control(timeout, || {
-            if revision < self.latest_restored_state.load(Ordering::Relaxed) {
-                return false;
-            }
             // SAFETY: The parameter pointers remain live, and neither process nor flush is active.
             let success = unsafe {
                 state::deserialize_object::<P>(
@@ -1942,14 +2028,14 @@ impl<P: ClapPlugin> Wrapper<P> {
                 )
             };
             if success {
-                self.latest_restored_state
-                    .store(revision, Ordering::Relaxed);
-                let cutoff = self.next_revision();
+                let output_cutoff = self.next_revision();
                 // The migration hook may change the parameter set. Supersede only saved
                 // parameters actually resolved by this restore.
                 for id in state.params.keys() {
                     if let Some(hash) = self.param_id_to_hash.get(id) {
-                        self.restored_parameter_revisions[hash].store(cutoff, Ordering::Relaxed);
+                        let cutoff = &self.restored_parameter_revisions[hash];
+                        cutoff.incoming.store(revision, Ordering::Relaxed);
+                        cutoff.outgoing.store(output_cutoff, Ordering::Relaxed);
                     }
                 }
             }
@@ -2014,9 +2100,11 @@ impl<P: ClapPlugin> Wrapper<P> {
     unsafe extern "C" fn destroy(plugin: *const clap_plugin) {
         assert!(!plugin.is_null() && unsafe { !(*plugin).plugin_data.is_null() });
         let this = unsafe { Arc::from_raw((*plugin).plugin_data as *mut Self) };
-        if let Some(background_thread) = this.background_thread.borrow().as_ref() {
-            background_thread.quiesce();
+        #[cfg(feature = "editor")]
+        {
+            *this.editor_tasks_open.write() = false;
         }
+        this.background_thread.close();
         crate::nice_debug_assert_eq!(Arc::strong_count(&this), 1);
 
         drop(this);
@@ -2500,21 +2588,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                         };
                         transport.pos_seconds = Some(seconds + advance);
                     }
-                    // TODO: CLAP does not mention whether this is behind a flag or not
-                    if transport.playing && elapsed_samples > 0 {
-                        transport.bar_start_pos_beats = match transport.bar_start_pos_beats() {
-                            Some(updated) => Some(updated),
-                            None => Some(context.bar_start as f64 / CLAP_BEATTIME_FACTOR as f64),
-                        };
-                        transport.bar_number = match transport.bar_number() {
-                            Some(updated) => Some(updated),
-                            None => Some(context.bar_number),
-                        };
-                    } else {
-                        transport.bar_start_pos_beats =
-                            Some(context.bar_start as f64 / CLAP_BEATTIME_FACTOR as f64);
-                        transport.bar_number = Some(context.bar_number);
-                    }
+                    advance_transport_bar(&mut transport, context, elapsed_samples);
                     // TODO: They also aren't very clear about this, but presumably if the loop is
                     //       active and the corresponding song transport information is available then
                     //       this is also available
@@ -2720,14 +2794,6 @@ impl<P: ClapPlugin> Wrapper<P> {
         // on the main thread, so once that's done we can just handle all requests here
         while let Some(task) = wrapper.tasks.pop() {
             wrapper.execute(task, true);
-        }
-
-        #[cfg(feature = "editor")]
-        {
-            let pending = wrapper.pending_editor_state.lock().take();
-            if let Some((revision, state)) = pending {
-                wrapper.apply_or_queue_editor_state(revision, state, Duration::ZERO);
-            }
         }
 
         if !wrapper.state_access.control_pending.load(Ordering::Acquire)
@@ -3675,7 +3741,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             return;
         };
 
-        unsafe { wrapper.handle_in_events(in_.as_ref(), 0, 0) };
+        unsafe { wrapper.handle_flush_events(in_.as_ref()) };
 
         if let Some(out) = unsafe { out.as_ref() } {
             let sample_rate = wrapper

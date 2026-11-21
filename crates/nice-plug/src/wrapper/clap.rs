@@ -18,6 +18,64 @@ pub use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
 pub use clap_sys::version::CLAP_VERSION;
 use nice_plug_core::context::remote_controls::RemoteControlsContext;
 use nice_plug_core::plugin::Plugin;
+use parking_lot::Mutex;
+use std::sync::Arc;
+
+/// Owns the background workers for as long as this CLAP library is initialized. An instance can
+/// close its task queue during destroy. The final deinit joins the workers before library unload.
+#[doc(hidden)]
+pub struct LibraryWorkers(Mutex<LibraryWorkerState>);
+
+struct LibraryWorkerState {
+    clients: usize,
+    workers: Vec<Arc<dyn Send + Sync>>,
+}
+
+impl LibraryWorkers {
+    pub const fn new() -> Self {
+        Self(Mutex::new(LibraryWorkerState {
+            clients: 0,
+            workers: Vec::new(),
+        }))
+    }
+
+    pub fn initialize(&self) {
+        self.0.lock().clients += 1;
+    }
+
+    pub fn deinitialize(&self) {
+        let workers = {
+            let mut state = self.0.lock();
+            if state.clients == 0 {
+                return;
+            }
+            state.clients -= 1;
+            if state.clients != 0 {
+                return;
+            }
+            std::mem::take(&mut state.workers)
+        };
+        // Dropping the worker handles joins them outside the registry lock.
+        drop(workers);
+    }
+
+    fn retain(&self, worker: Arc<dyn Send + Sync>) {
+        let mut state = self.0.lock();
+        if !state
+            .workers
+            .iter()
+            .any(|current| Arc::ptr_eq(current, &worker))
+        {
+            state.workers.push(worker);
+        }
+    }
+}
+
+impl Default for LibraryWorkers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Provides auxiliary metadata needed for a CLAP plugin.
 #[allow(unused_variables)]
@@ -78,7 +136,7 @@ macro_rules! nice_export_clap {
         #[doc(hidden)]
         mod clap {
             use $crate::wrapper::setup_logger;
-            use $crate::wrapper::clap::{PluginDescriptor, Wrapper};
+            use $crate::wrapper::clap::{LibraryWorkers, PluginDescriptor, Wrapper};
             use $crate::wrapper::clap::{CLAP_PLUGIN_FACTORY_ID, clap_host, clap_plugin, clap_plugin_descriptor, clap_plugin_factory};
             use ::std::collections::HashSet;
             use ::std::ffi::{CStr, c_void};
@@ -88,6 +146,8 @@ macro_rules! nice_export_clap {
             // Because the `$plugin_ty`s are likely defined in the enclosing scope. This works even
             // if the types are not public because this is a child module.
             use super::*;
+
+            static LIBRARY_WORKERS: LibraryWorkers = LibraryWorkers::new();
 
             const CLAP_PLUGIN_FACTORY: clap_plugin_factory = clap_plugin_factory {
                 get_plugin_count: Some(get_plugin_count),
@@ -157,6 +217,7 @@ macro_rules! nice_export_clap {
                         let Some(instance) = (unsafe { Wrapper::<$plugin_ty>::new(host) }) else {
                             return ::std::ptr::null();
                         };
+                        instance.retain_background_worker(&LIBRARY_WORKERS);
                         return unsafe { (*Arc::into_raw(instance)).clap_plugin.as_ptr() };
                     }
 
@@ -168,10 +229,16 @@ macro_rules! nice_export_clap {
 
             pub extern "C" fn init(_plugin_path: *const c_char) -> bool {
                 $({setup_logger::<$plugin_ty>();})+
-                !plugin_descriptors().is_empty()
+                if plugin_descriptors().is_empty() {
+                    return false;
+                }
+                LIBRARY_WORKERS.initialize();
+                true
             }
 
-            pub extern "C" fn deinit() {}
+            pub extern "C" fn deinit() {
+                LIBRARY_WORKERS.deinitialize();
+            }
 
             pub extern "C" fn get_factory(factory_id: *const c_char) -> *const c_void {
                 if !factory_id.is_null()

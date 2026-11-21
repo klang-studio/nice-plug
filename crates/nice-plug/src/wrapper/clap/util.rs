@@ -251,13 +251,15 @@ mod tests {
     struct WriteState {
         output: Vec<u8>,
         max_chunk: u64,
-        invalid_result: Option<i64>,
+        failure: Option<(usize, i64)>,
     }
 
     unsafe extern "C" fn write(stream: *const clap_ostream, input: *const c_void, len: u64) -> i64 {
         // SAFETY: Our test stream holds this live context.
         let context = unsafe { &mut *((*stream).ctx.cast::<WriteState>()) };
-        if let Some(result) = context.invalid_result {
+        if let Some((after, result)) = context.failure
+            && context.output.len() >= after
+        {
             return result;
         }
         let count = cmp::min(len, context.max_chunk) as usize;
@@ -282,7 +284,7 @@ mod tests {
         let mut writer = WriteState {
             output: Vec::new(),
             max_chunk: 2,
-            invalid_result: None,
+            failure: None,
         };
         write_state_record(&writer.stream(), payload, payload.len()).unwrap();
         assert_eq!(&writer.output[..8], &(payload.len() as u64).to_le_bytes());
@@ -336,7 +338,7 @@ mod tests {
         let mut writer = WriteState {
             output: Vec::new(),
             max_chunk: 2,
-            invalid_result: None,
+            failure: None,
         };
         assert!(write_state_record(&writer.stream(), b"ab", 1).is_err());
         assert!(writer.output.is_empty());
@@ -355,10 +357,25 @@ mod tests {
             let mut writer = WriteState {
                 output: Vec::new(),
                 max_chunk: 2,
-                invalid_result: Some(result),
+                failure: Some((0, result)),
             };
             assert!(write_state_record(&writer.stream(), b"ab", 64).is_err());
             assert!(writer.output.is_empty());
         }
+    }
+    #[test]
+    fn partial_state_payload_write_reports_failure() {
+        let payload = b"abcdef";
+        let mut writer = WriteState {
+            output: Vec::new(),
+            max_chunk: 2,
+            failure: Some((10, -1)),
+        };
+        assert_eq!(
+            write_state_record(&writer.stream(), payload, payload.len()),
+            Err("could not write the complete state payload"),
+        );
+        assert_eq!(&writer.output[..8], &(payload.len() as u64).to_le_bytes());
+        assert_eq!(&writer.output[8..], b"ab");
     }
 }

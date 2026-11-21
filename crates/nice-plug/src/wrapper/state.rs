@@ -6,7 +6,11 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use nice_plug_core::{
     audio_setup::BufferConfig,
-    params::{InternalParamMut, Param, Params, internals::ParamPtr},
+    params::{
+        InternalParamMut, Param, Params,
+        internals::ParamPtr,
+        range::{FloatRange, IntRange},
+    },
     plugin::{ParamValue, Plugin, PluginState},
 };
 
@@ -97,7 +101,7 @@ pub(crate) unsafe fn serialize_json<'a, P: Plugin>(
     unsafe { serialize_json_bounded::<P>(plugin_params, params_iter, usize::MAX) }
 }
 
-/// Serialize state with the same decoded and encoded size limit used on load.
+/// Serialize state with the same stored payload limit used on load.
 pub(crate) unsafe fn serialize_json_bounded<'a, P: Plugin>(
     plugin_params: Arc<dyn Params>,
     params_iter: impl IntoIterator<Item = (&'a String, ParamPtr)>,
@@ -108,21 +112,48 @@ pub(crate) unsafe fn serialize_json_bounded<'a, P: Plugin>(
 }
 
 fn encode_json(state: &PluginState, limit: usize) -> Result<Vec<u8>> {
-    let json = serde_json::to_vec(state).context("Could not format as JSON")?;
-    ensure!(json.len() <= limit, "Decoded state exceeds the size limit");
-
     #[cfg(feature = "zstd")]
-    {
-        let compressed = zstd::encode_all(json.as_slice(), zstd::DEFAULT_COMPRESSION_LEVEL)
-            .context("Could not compress state")?;
-        ensure!(
-            compressed.len() <= limit,
-            "Stored state exceeds the size limit"
-        );
-        Ok(compressed)
-    }
+    let payload = {
+        // Write JSON straight to the compressor so large compressible states do not need a
+        // separate uncompressed buffer.
+        let encoder =
+            zstd::stream::write::Encoder::new(Vec::new(), zstd::DEFAULT_COMPRESSION_LEVEL)
+                .context("Could not create state compressor")?;
+        let mut writer = std::io::BufWriter::new(encoder);
+        serde_json::to_writer(&mut writer, state).context("Could not write compressed JSON")?;
+        writer
+            .into_inner()
+            .map_err(|error| error.into_error())
+            .context("Could not flush compressed JSON")?
+            .finish()
+            .context("Could not finish compressing state")?
+    };
     #[cfg(not(feature = "zstd"))]
-    Ok(json)
+    let payload = serde_json::to_vec(state).context("Could not format as JSON")?;
+
+    ensure!(
+        payload.len() <= limit,
+        "Stored state exceeds the size limit"
+    );
+    Ok(payload)
+}
+
+fn float_range_contains(range: FloatRange, value: f32) -> bool {
+    match range {
+        FloatRange::Linear { min, max }
+        | FloatRange::Skewed { min, max, .. }
+        | FloatRange::SymmetricalSkewed { min, max, .. } => {
+            value.is_finite() && (min..=max).contains(&value)
+        }
+        FloatRange::Reversed(range) => float_range_contains(*range, value),
+    }
+}
+
+fn int_range_contains(range: IntRange, value: i32) -> bool {
+    match range {
+        IntRange::Linear { min, max } => (min..=max).contains(&value),
+        IntRange::Reversed(range) => int_range_contains(*range, value),
+    }
 }
 
 /// Deserialize a plugin's state from a [`PluginState`] object. This is used to allow the plugin to
@@ -146,98 +177,71 @@ pub(crate) unsafe fn deserialize_object<P: Plugin>(
     // This lets the plugin perform migrations on old state if needed
     P::filter_state(state);
 
-    // Validate after the plugin's migration, before changing any persisted value or field.
+    // Validate after migration and resolve stable enum IDs before calling any setters.
     // IDs removed in a newer version remain compatible.
+    let mut values = Vec::new();
     for (param_id, value) in &state.params {
         let Some(param) = params_getter(param_id) else {
+            #[cfg(debug_assertions)]
+            crate::nice_warn!("Unknown parameter: {}", param_id);
             continue;
         };
-        let valid = match (param, value) {
-            (ParamPtr::FloatParam(_), ParamValue::F32(value)) => value.is_finite(),
-            (ParamPtr::IntParam(_), ParamValue::I32(_))
-            | (ParamPtr::BoolParam(_), ParamValue::Bool(_))
-            | (ParamPtr::EnumParam(_), ParamValue::String(_)) => true,
-            (ParamPtr::EnumParam(param), ParamValue::I32(index)) => {
-                // SAFETY: This pointer comes from the live parameter map.
-                usize::try_from(*index).is_ok_and(|index| index < unsafe { (*param).len() })
+        // SAFETY: The pointers come from the live parameter map supplied by the caller.
+        let value = unsafe {
+            match (param, value) {
+                (ParamPtr::FloatParam(p), ParamValue::F32(value))
+                    if float_range_contains((*p).range(), *value) =>
+                {
+                    Some(ParamValue::F32(*value))
+                }
+                (ParamPtr::IntParam(p), ParamValue::I32(value))
+                    if int_range_contains((*p).range(), *value) =>
+                {
+                    Some(ParamValue::I32(*value))
+                }
+                (ParamPtr::BoolParam(_), ParamValue::Bool(value)) => Some(ParamValue::Bool(*value)),
+                (ParamPtr::EnumParam(p), ParamValue::I32(index))
+                    if usize::try_from(*index).is_ok_and(|index| index < (*p).len()) =>
+                {
+                    Some(ParamValue::I32(*index))
+                }
+                (ParamPtr::EnumParam(p), ParamValue::String(id)) => {
+                    (*p).index_from_id(id).map(ParamValue::I32)
+                }
+                _ => None,
             }
-            _ => false,
         };
-        if !valid {
+        let Some(value) = value else {
             crate::nice_warn!("Invalid serialized value for parameter {param_id:?}");
             return false;
-        }
+        };
+        values.push((param, value));
     }
 
     let sample_rate = current_buffer_config.map(|c| c.sample_rate);
-    // Resolving a stable ID uses the pinned enum API's setter. Retain the previous
-    // indices so a failed lookup can restore earlier changes via the usual callbacks.
-    let mut applied_enums = Vec::new();
-    for (param_id, value) in &state.params {
-        if let (ParamValue::String(id), Some(ParamPtr::EnumParam(param))) =
-            (value, params_getter(param_id))
-        {
-            // SAFETY: This pointer comes from the live parameter map.
-            let param = unsafe { &*param };
-            let previous = param.unmodulated_plain_value();
-            if param.set_from_id(id) {
-                applied_enums.push((param, previous));
-            } else {
-                for (param, previous) in applied_enums.into_iter().rev() {
-                    // SAFETY: These are live parameters and state restore already holds
-                    // exclusive access. This index was read from the same parameter.
-                    unsafe { param._internal_set_plain_value(previous) };
-                }
-                crate::nice_warn!("Unknown ID {id:?} for enum parameter {param_id:?}");
-                return false;
-            }
-        }
-    }
-
-    // Wait for all symbolic IDs to resolve before resetting any smoother.
-    if let Some(sample_rate) = sample_rate {
-        for (param, _) in applied_enums {
-            // SAFETY: State restore holds exclusive access to these live parameters.
-            unsafe { param._internal_update_smoother(sample_rate, true) };
-        }
-    }
-
-    for (param_id_str, param_value) in &state.params {
-        let param_ptr = match params_getter(param_id_str.as_str()) {
-            Some(ptr) => ptr,
-            None => {
-                #[cfg(debug_assertions)]
-                crate::nice_warn!("Unknown parameter: {}", param_id_str);
-                continue;
-            }
-        };
-
+    for (param, value) in values {
+        // SAFETY: These are the same live parameters and validated plain values from above.
         unsafe {
-            match (param_ptr, param_value) {
+            match (param, value) {
                 (ParamPtr::FloatParam(p), ParamValue::F32(v)) => {
-                    (*p)._internal_set_plain_value(*v);
+                    (*p)._internal_set_plain_value(v);
                 }
                 (ParamPtr::IntParam(p), ParamValue::I32(v)) => {
-                    (*p)._internal_set_plain_value(*v);
+                    (*p)._internal_set_plain_value(v);
                 }
                 (ParamPtr::BoolParam(p), ParamValue::Bool(v)) => {
-                    (*p)._internal_set_plain_value(*v);
+                    (*p)._internal_set_plain_value(v);
                 }
-                // Enums are either serialized based on the active variant's index (which may not be the
-                // same as the discriminator), or a custom set stable string ID. The latter allows the
-                // variants to be reordered.
-                (ParamPtr::EnumParam(p), ParamValue::I32(variant_idx)) => {
-                    (*p)._internal_set_plain_value(*variant_idx);
+                (ParamPtr::EnumParam(p), ParamValue::I32(v)) => {
+                    (*p)._internal_set_plain_value(v);
                 }
-                // Stable enum IDs were applied above.
-                (ParamPtr::EnumParam(_), ParamValue::String(_)) => continue,
-                _ => continue, // Already checked before applying any values.
+                _ => unreachable!("Only validated typed values are applied"),
             }
-        }
 
-        // Make sure everything starts out in sync
-        if let Some(sample_rate) = sample_rate {
-            unsafe { param_ptr._internal_update_smoother(sample_rate, true) };
+            // Make sure everything starts out in sync.
+            if let Some(sample_rate) = sample_rate {
+                param._internal_update_smoother(sample_rate, true);
+            }
         }
     }
 
@@ -269,36 +273,16 @@ fn decode_json(state: &[u8], limit: usize) -> Result<PluginState> {
     ensure!(state.len() <= limit, "Stored state exceeds the size limit");
 
     #[cfg(feature = "zstd")]
+    if let Ok(decoder) = zstd::stream::read::Decoder::with_buffer(state)
+        && let Ok(decoded) = serde_json::from_reader(std::io::BufReader::new(decoder))
     {
-        // Old plugins could save plain JSON before compression was enabled. Try that format
-        // only if the compressed decoder fails, never after a successful but oversized decode.
-        if let Ok(decompressed) = decode_zstd(state, limit) {
-            ensure!(
-                decompressed.len() <= limit,
-                "Decoded state exceeds the size limit"
-            );
-            return serde_json::from_slice(&decompressed).context("Invalid plugin state JSON");
-        }
+        // The CLAP limit is on stored bytes. Stream the decoded JSON into the state object,
+        // since legacy compressed records can expand past that limit.
+        return Ok(decoded);
     }
+
+    // Plain JSON remains readable after compression is enabled.
     serde_json::from_slice(state).context("Invalid plugin state JSON")
-}
-
-#[cfg(feature = "zstd")]
-fn decode_zstd(state: &[u8], limit: usize) -> std::io::Result<Vec<u8>> {
-    use std::io::Read;
-
-    let mut decoder = zstd::stream::read::Decoder::with_buffer(state)?;
-    if limit != usize::MAX {
-        // Preserve the default compressor's working window even for short frames.
-        // Larger windows still cannot exceed the rounded-up state cap.
-        decoder.window_log_max((limit.max(1 << 21) - 1).ilog2() + 1)?;
-    }
-    let mut output = Vec::new();
-    // Read one extra byte to distinguish a document exactly at the cap from a longer one.
-    decoder
-        .take((limit as u64).saturating_add(1))
-        .read_to_end(&mut output)?;
-    Ok(output)
 }
 
 #[cfg(test)]
