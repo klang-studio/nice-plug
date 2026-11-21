@@ -19,6 +19,7 @@ pub use clap_sys::version::CLAP_VERSION;
 use nice_plug_core::context::remote_controls::RemoteControlsContext;
 use nice_plug_core::plugin::Plugin;
 use parking_lot::Mutex;
+use std::any::Any;
 use std::sync::Arc;
 
 /// Owns the background workers for as long as this CLAP library is initialized. An instance can
@@ -105,6 +106,15 @@ pub trait ClapPlugin: Plugin {
     /// that the host can use to provide better hardware mapping for a plugin. See the linked
     /// extension for more information.
     fn remote_controls(&self, context: &mut impl RemoteControlsContext) {}
+
+    /// Supplies optional per-instance data for custom CLAP extension callbacks. The wrapper calls
+    /// this once at instance creation and owns the data until destruction. The extension may
+    /// access it independently of the audio processor via [`Wrapper::with_custom_extension_data`].
+    /// The data must support the threads documented by those callbacks and must not retain the
+    /// plugin instance or its host beyond the CLAP instance's lifetime.
+    fn clap_custom_extension_data(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
 
     /// Supplies an optional custom CLAP plugin extension after the wrapper's built-in dispatch.
     ///

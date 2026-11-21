@@ -80,6 +80,7 @@ use nice_plug_core::plugin::{TrackColor, TrackInfo};
 use parking_lot::Mutex;
 #[cfg(feature = "editor")]
 use parking_lot::RwLock;
+use std::any::Any;
 #[cfg(feature = "editor")]
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -329,6 +330,8 @@ pub struct Wrapper<P: ClapPlugin> {
     /// `ParamPtr`s are guaranteed to live at least as long as this object and we can interact with
     /// the `Params` object without having to acquire a lock on `plugin`.
     params: Arc<dyn Params>,
+    /// Immutable type-erased data for custom extension callbacks.
+    custom_extension_data: Option<Arc<dyn Any + Send + Sync>>,
     /// The plugin's editor, if it has one. This object does not do anything on its own, but we need
     /// to instantiate this in advance so we don't need to lock the entire [`Plugin`] object when
     /// creating an editor. Wrapped in an `AtomicRefCell` because it needs to be initialized late.
@@ -769,6 +772,7 @@ impl<P: ClapPlugin> Wrapper<P> {
         let wrapper = Self {
             this: AtomicRefCell::new(Weak::new()),
 
+            custom_extension_data: plugin.clap_custom_extension_data(),
             plugin: TryLock::new(plugin),
             task_executor,
             params,
@@ -2744,6 +2748,28 @@ impl<P: ClapPlugin> Wrapper<P> {
         check_null_ptr!(None, plugin, unsafe { (*plugin).plugin_data });
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
         wrapper.param_id_to_hash.get(author_id).copied()
+    }
+
+    /// Calls `read` with the instance data supplied by [`ClapPlugin::clap_custom_extension_data`].
+    /// Returns `None` for an absent value or a different data type. The wrapper does not take its
+    /// state or processor locks and does not clone the Arc. Each extension decides which threads
+    /// can call its own callbacks.
+    ///
+    /// # Safety
+    /// `plugin` must be null or point to a live CLAP plugin created by this `Wrapper<P>`, and the
+    /// instance must stay alive until the callback returns.
+    pub unsafe fn with_custom_extension_data<T: Any + Send + Sync, R>(
+        plugin: *const clap_plugin,
+        read: impl FnOnce(&T) -> R,
+    ) -> Option<R> {
+        check_null_ptr!(None, plugin, unsafe { (*plugin).plugin_data });
+        // SAFETY: The caller ensures that the wrapper has the correct type and stays alive.
+        let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
+        wrapper
+            .custom_extension_data
+            .as_deref()?
+            .downcast_ref::<T>()
+            .map(read)
     }
 
     unsafe extern "C" fn get_extension(

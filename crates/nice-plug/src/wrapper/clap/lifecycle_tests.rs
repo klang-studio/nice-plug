@@ -163,6 +163,10 @@ impl ClapPlugin for TestPlugin {
     const CLAP_MANUAL_URL: Option<&'static str> = None;
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
     const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::AudioEffect];
+
+    fn clap_custom_extension_data(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        Some(self.0.clone())
+    }
 }
 
 const HOST: clap_host = clap_host {
@@ -228,6 +232,40 @@ fn a_pending_request_excludes_new_audio_and_does_not_wait_after_apply() {
         assert_eq!(request.join().unwrap(), Some(42));
     });
     assert!(access.try_audio().is_some());
+}
+
+#[test]
+fn custom_extension_data_belongs_to_the_live_instance() {
+    // SAFETY: The host and both instances outlive all extension accessor calls below.
+    unsafe {
+        let first = Wrapper::<TestPlugin>::new(&HOST).unwrap();
+        let second = Wrapper::<TestPlugin>::new(&HOST).unwrap();
+        let read_address = |wrapper: &Wrapper<TestPlugin>| {
+            Wrapper::<TestPlugin>::with_custom_extension_data::<TestParams, _>(
+                wrapper.clap_plugin.as_ptr(),
+                ptr::from_ref,
+            )
+        };
+        let first_data = read_address(&first).unwrap();
+        let second_data = read_address(&second).unwrap();
+        assert_ne!(first_data, second_data);
+
+        let first_plugin = first.clap_plugin.as_ptr();
+        assert_eq!(
+            Wrapper::<TestPlugin>::with_custom_extension_data::<TestParams, _>(
+                first_plugin,
+                |data| data.gain.value(),
+            ),
+            Some(0.5),
+        );
+        assert_eq!(
+            Wrapper::<TestPlugin>::with_custom_extension_data::<AtomicU32, _>(
+                first_plugin,
+                |data| data.load(Ordering::Relaxed),
+            ),
+            None,
+        );
+    }
 }
 
 #[test]
