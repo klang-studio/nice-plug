@@ -43,6 +43,17 @@ pub trait ClapPlugin: Plugin {
     /// that the host can use to provide better hardware mapping for a plugin. See the linked
     /// extension for more information.
     fn remote_controls(&self, context: &mut impl RemoteControlsContext) {}
+
+    /// Supplies an optional custom CLAP plugin extension after the wrapper's built-in dispatch.
+    ///
+    /// # Safety
+    ///
+    /// Implementations must be thread-safe and return null for unsupported IDs. Non-null pointers
+    /// must point to immutable extension tables with the C layout and calling convention required
+    /// by the requested ID. A table must remain valid until the plugin instance is destroyed.
+    unsafe fn clap_custom_extension(_id: &std::ffi::CStr) -> *const std::ffi::c_void {
+        std::ptr::null()
+    }
 }
 
 /// Configuration for the plugin's polyphonic modulation options, if it supports .

@@ -2302,6 +2302,27 @@ impl<P: ClapPlugin> Wrapper<P> {
         })
     }
 
+    /// Looks up the numeric ID reported by CLAP params for an author's parameter ID.
+    ///
+    /// Returns None for an unknown ID or an ambiguous inventory (duplicate author IDs or
+    /// numeric hash collisions). This uses the same maps as the live CLAP parameter wrapper.
+    ///
+    /// # Safety
+    ///
+    /// `plugin` must be a live CLAP plugin created by this `Wrapper<P>`, or null.
+    pub unsafe fn custom_extension_param_id(
+        plugin: *const clap_plugin,
+        author_id: &str,
+    ) -> Option<clap_id> {
+        check_null_ptr!(None, plugin, unsafe { (*plugin).plugin_data });
+        let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
+        let count = wrapper.param_hashes.len();
+        if wrapper.param_id_to_hash.len() != count || wrapper.param_id_by_hash.len() != count {
+            return None;
+        }
+        wrapper.param_id_to_hash.get(author_id).copied()
+    }
+
     unsafe extern "C" fn get_extension(
         plugin: *const clap_plugin,
         id: *const c_char,
@@ -2362,8 +2383,12 @@ impl<P: ClapPlugin> Wrapper<P> {
                 std::ptr::null()
             }
         } else {
-            crate::nice_trace!("Host tried to query unknown extension {:?}", id);
-            std::ptr::null()
+            // SAFETY: Implementors provide the matching, thread-safe extension table.
+            let custom = unsafe { P::clap_custom_extension(id) };
+            if custom.is_null() {
+                crate::nice_trace!("Host tried to query unknown extension {:?}", id);
+            }
+            custom
         }
     }
 
