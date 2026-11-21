@@ -1879,6 +1879,24 @@ impl<P: ClapPlugin> Wrapper<P> {
                 let event = unsafe { &*(event as *const clap_event_midi) };
 
                 match NoteEvent::from_midi(timing, &event.data) {
+                    Ok(NoteEvent::NoteOff {
+                        channel: Channel::Number(channel),
+                        key: Key::Number(key),
+                        velocity,
+                        ..
+                    }) if P::MIDI_INPUT >= MidiConfig::Basic
+                        && P::CLAP_DISTINGUISH_MIDI_NOTE_OFF =>
+                    {
+                        push_event(
+                            input_events,
+                            NoteEvent::MidiNoteOff {
+                                timing,
+                                channel,
+                                key,
+                                velocity,
+                            },
+                        );
+                    }
                     Ok(
                         note_event @ (NoteEvent::NoteOn { .. }
                         | NoteEvent::NoteOff { .. }

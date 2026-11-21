@@ -158,6 +158,7 @@ impl Plugin for TestPlugin {
 
 impl ClapPlugin for TestPlugin {
     const CLAP_ID: &'static str = "org.nice-plug.wrapper-lifecycle-test";
+    const CLAP_DISTINGUISH_MIDI_NOTE_OFF: bool = true;
     const CLAP_DESCRIPTION: Option<&'static str> = None;
     const CLAP_MANUAL_URL: Option<&'static str> = None;
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
@@ -227,6 +228,84 @@ fn a_pending_request_excludes_new_audio_and_does_not_wait_after_apply() {
         assert_eq!(request.join().unwrap(), Some(42));
     });
     assert!(access.try_audio().is_some());
+}
+
+#[test]
+fn opted_in_midi_note_off_has_a_distinct_event_even_when_replayed() {
+    let note_off = clap_event_note {
+        header: clap_event_header {
+            size: mem::size_of::<clap_event_note>() as u32,
+            time: 3,
+            space_id: CLAP_CORE_EVENT_SPACE_ID,
+            type_: CLAP_EVENT_NOTE_OFF,
+            flags: 0,
+        },
+        note_id: -1,
+        port_index: 0,
+        channel: 2,
+        key: 60,
+        velocity: 0.0,
+    };
+    let midi_off = clap_event_midi {
+        header: clap_event_header {
+            size: mem::size_of::<clap_event_midi>() as u32,
+            type_: CLAP_EVENT_MIDI,
+            ..note_off.header
+        },
+        port_index: 0,
+        data: [0x92, 60, 0],
+    };
+    let headers = [&raw const note_off.header, &raw const midi_off.header];
+    let events = input_event_list(&headers);
+    // SAFETY: The host, event buffers and list live until all wrapper calls finish.
+    unsafe {
+        let wrapper = Wrapper::<TestPlugin>::new(&HOST).unwrap();
+        let mut transport = ptr::null();
+        wrapper.handle_in_events_until(Some(&events), &mut transport, 0, 4, 0, |_| false);
+        {
+            let mut input = wrapper.input_events.borrow_mut();
+            assert!(matches!(
+                input.pop_front(),
+                Some(NoteEvent::NoteOff {
+                    timing: 3,
+                    voice_id: VoiceID::Wildcard,
+                    ..
+                })
+            ));
+            assert_eq!(
+                input.pop_front(),
+                Some(NoteEvent::MidiNoteOff {
+                    timing: 3,
+                    channel: 2,
+                    key: 60,
+                    velocity: 0.0
+                })
+            );
+            assert!(input.is_empty());
+        }
+
+        wrapper.defer_input(&events, true);
+        wrapper.handle_in_events_until(None, &mut transport, 0, 4, 0, |_| false);
+        let mut input = wrapper.input_events.borrow_mut();
+        assert!(matches!(
+            input.pop_front(),
+            Some(NoteEvent::NoteOff {
+                timing: 0,
+                voice_id: VoiceID::Wildcard,
+                ..
+            })
+        ));
+        assert_eq!(
+            input.pop_front(),
+            Some(NoteEvent::MidiNoteOff {
+                timing: 0,
+                channel: 2,
+                key: 60,
+                velocity: 0.0
+            })
+        );
+        assert!(input.is_empty());
+    }
 }
 
 #[test]

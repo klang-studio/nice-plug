@@ -93,6 +93,10 @@ pub trait ClapPlugin: Plugin {
     /// browser.
     const CLAP_FEATURES: &'static [ClapFeature];
 
+    /// Deliver raw MIDI releases as `NoteEvent::MidiNoteOff`, so a plugin can distinguish
+    /// them from CLAP note-offs whose voice ID is a wildcard.
+    const CLAP_DISTINGUISH_MIDI_NOTE_OFF: bool = false;
+
     /// If set, this informs the host about the plugin's capabilities for polyphonic modulation.
     const CLAP_POLY_MODULATION_CONFIG: Option<PolyModulationConfig> = None;
 

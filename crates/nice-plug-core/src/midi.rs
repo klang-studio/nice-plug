@@ -177,6 +177,17 @@ pub enum NoteEvent<S> {
         /// 128 levels available in MIDI.
         velocity: f32,
     },
+    /// A raw MIDI note release, with no host voice ID. The CLAP wrapper emits this instead
+    /// of a wildcard [`NoteEvent::NoteOff`] when the plugin opts in.
+    MidiNoteOff {
+        timing: u32,
+        /// The MIDI channel in `0..16`.
+        channel: u8,
+        /// The MIDI key in `0..128`.
+        key: u8,
+        /// The release velocity in `[0, 1]`.
+        velocity: f32,
+    },
     /// A note choke event, available on [`MidiConfig::Basic`] and up. When the host sends this to
     /// the plugin, it indicates that a voice or all sound associated with a note should immediately
     /// stop playing.
@@ -439,7 +450,7 @@ impl<S> NoteEvent<S> {
     pub fn timing(&self) -> u32 {
         match self {
             NoteEvent::NoteOn { timing, .. } => *timing,
-            NoteEvent::NoteOff { timing, .. } => *timing,
+            NoteEvent::NoteOff { timing, .. } | NoteEvent::MidiNoteOff { timing, .. } => *timing,
             NoteEvent::Choke { timing, .. } => *timing,
             NoteEvent::VoiceTerminated { timing, .. } => *timing,
             NoteEvent::PolyModulation { timing, .. } => *timing,
@@ -475,7 +486,7 @@ impl<S> NoteEvent<S> {
             NoteEvent::PolyVibrato { voice_id, .. } => Some(*voice_id),
             NoteEvent::PolyExpression { voice_id, .. } => Some(*voice_id),
             NoteEvent::PolyBrightness { voice_id, .. } => Some(*voice_id),
-            NoteEvent::MidiChannelPressure { .. } => None,
+            NoteEvent::MidiNoteOff { .. } | NoteEvent::MidiChannelPressure { .. } => None,
             NoteEvent::MidiPitchBend { .. } => None,
             NoteEvent::MidiCC { .. } => None,
             NoteEvent::MidiProgramChange { .. } => None,
@@ -499,7 +510,8 @@ impl<S> NoteEvent<S> {
             NoteEvent::PolyVibrato { channel, .. } => Some(*channel),
             NoteEvent::PolyExpression { channel, .. } => Some(*channel),
             NoteEvent::PolyBrightness { channel, .. } => Some(*channel),
-            NoteEvent::MidiChannelPressure { channel, .. } => Some(Channel::Number(*channel)),
+            NoteEvent::MidiNoteOff { channel, .. }
+            | NoteEvent::MidiChannelPressure { channel, .. } => Some(Channel::Number(*channel)),
             NoteEvent::MidiPitchBend { channel, .. } => Some(Channel::Number(*channel)),
             NoteEvent::MidiCC { channel, .. } => Some(Channel::Number(*channel)),
             NoteEvent::MidiProgramChange { channel, .. } => Some(Channel::Number(*channel)),
@@ -647,6 +659,16 @@ impl<S: SysExMessage> NoteEvent<S> {
                 key.number().unwrap_or(0),
                 (velocity * 127.0).round().clamp(0.0, 127.0) as u8,
             ])),
+            NoteEvent::MidiNoteOff {
+                channel,
+                key,
+                velocity,
+                ..
+            } => Some(MidiResult::Basic([
+                midi::NOTE_OFF | *channel,
+                *key,
+                (velocity * 127.0).round().clamp(0.0, 127.0) as u8,
+            ])),
             NoteEvent::PolyPressure {
                 timing: _,
                 voice_id: _,
@@ -726,7 +748,9 @@ impl<S: SysExMessage> NoteEvent<S> {
     pub fn subtract_timing(&mut self, samples: u32) {
         match self {
             NoteEvent::NoteOn { timing, .. } => *timing -= samples,
-            NoteEvent::NoteOff { timing, .. } => *timing -= samples,
+            NoteEvent::NoteOff { timing, .. } | NoteEvent::MidiNoteOff { timing, .. } => {
+                *timing -= samples
+            }
             NoteEvent::Choke { timing, .. } => *timing -= samples,
             NoteEvent::VoiceTerminated { timing, .. } => *timing -= samples,
             NoteEvent::PolyModulation { timing, .. } => *timing -= samples,
