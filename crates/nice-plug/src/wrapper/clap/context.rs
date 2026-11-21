@@ -564,7 +564,7 @@ impl<P: ClapPlugin> nice_plug_core::context::gui::GuiContextInner for WrapperGui
 
         match wrapper.param_ptr_to_hash.get(&param) {
             Some(hash) => {
-                use crate::wrapper::clap::wrapper::OutputParamEvent;
+                use crate::wrapper::clap::wrapper::{OutputParamEvent, clap_plain_from_normalized};
 
                 // We queue the parameter change event here, and it will be sent to the host either
                 // at the end of the current processing cycle or after requesting an explicit flush
@@ -572,7 +572,7 @@ impl<P: ClapPlugin> nice_plug_core::context::gui::GuiContextInner for WrapperGui
                 // be changed when the output event is written to prevent changing parameter values
                 // in the middle of processing audio.
                 let clap_plain_value =
-                    normalized as f64 * unsafe { param.step_count().unwrap_or(1) as f64 };
+                    clap_plain_from_normalized(normalized, unsafe { param.step_count() });
                 let success = wrapper.queue_parameter_event(OutputParamEvent::SetValue {
                     param_hash: *hash,
                     clap_plain_value,

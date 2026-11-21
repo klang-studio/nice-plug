@@ -29,10 +29,10 @@ use clap_sys::ext::note_ports::{
     clap_plugin_note_ports,
 };
 use clap_sys::ext::params::{
-    CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_BYPASS, CLAP_PARAM_IS_HIDDEN,
-    CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID, CLAP_PARAM_IS_READONLY,
-    CLAP_PARAM_IS_ENUM, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params, clap_param_info,
-    clap_plugin_params,
+    CLAP_EXT_PARAMS, CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_BYPASS, CLAP_PARAM_IS_ENUM,
+    CLAP_PARAM_IS_HIDDEN, CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_IS_MODULATABLE_PER_NOTE_ID,
+    CLAP_PARAM_IS_READONLY, CLAP_PARAM_IS_STEPPED, CLAP_PARAM_RESCAN_VALUES, clap_host_params,
+    clap_param_info, clap_plugin_params,
 };
 use clap_sys::ext::remote_controls::{
     CLAP_EXT_REMOTE_CONTROLS, clap_plugin_remote_controls, clap_remote_controls_page,
@@ -102,7 +102,7 @@ use crate::wrapper::clap::ClapPlugin;
 use crate::wrapper::clap::context::RemoteControlPages;
 #[cfg(feature = "editor")]
 use crate::wrapper::clap::context::WrapperGuiContext;
-use crate::wrapper::clap::util::{read_stream, write_stream};
+use crate::wrapper::clap::util::{read_state_record, write_state_record};
 use crate::wrapper::state::{self};
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 use crate::wrapper::util::{clamp_input_event_timing, hash_param_id, process_wrapper, strlcpy};
@@ -115,7 +115,7 @@ const OUTPUT_EVENT_QUEUE_CAPACITY: usize = 2048;
 ///
 /// If your plugin needs more storgage space than this, please post an issue in the nice-plug
 /// repository.
-const MAX_STATE_BYTES: u64 = 268_435_456;
+const MAX_STATE_BYTES: usize = 268_435_456;
 
 pub struct Wrapper<P: ClapPlugin> {
     /// A reference to this object, upgraded to an `Arc<Self>` for the GUI context.
@@ -225,6 +225,8 @@ pub struct Wrapper<P: ClapPlugin> {
     /// Mappings from parameter hashes to string parameter IDs. Used for notifying the plugin's
     /// editor about parameter changes.
     param_id_by_hash: HashMap<u32, String>,
+    /// Typed enum parameters whose complete CLAP value text is nonblank.
+    enum_param_hashes: HashSet<u32>,
     /// The group name of a parameter, indexed by the parameter's hash. Nested groups are delimited
     /// by slashes, and they're only used to allow the DAW to display parameters in a tree
     /// structure.
@@ -484,10 +486,12 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
 }
 
 impl<P: ClapPlugin> Wrapper<P> {
+    /// Creates a CLAP instance with a unique parameter inventory.
+    ///
     /// # Safety
     ///
     /// `host_callback` needs to outlive the returned object.
-    pub unsafe fn new(host_callback: *const clap_host) -> Arc<Self> {
+    pub unsafe fn new(host_callback: *const clap_host) -> Option<Arc<Self>> {
         let mut plugin = P::default();
         let task_executor = Mutex::new(plugin.task_executor());
 
@@ -515,6 +519,23 @@ impl<P: ClapPlugin> Wrapper<P> {
             .map(|(id, ptr, group)| {
                 let hash = hash_param_id(&id);
                 (id, hash, ptr, group)
+            })
+            .collect();
+        let mut seen_hashes = HashSet::new();
+        for (id, hash, _, _) in &param_id_hashes_ptrs_groups {
+            // Duplicate author IDs also have identical hashes. Check before creating any
+            // lookup maps, as an insertion would silently replace the earlier parameter.
+            if !seen_hashes.insert(*hash) {
+                crate::nice_error!("Duplicate or colliding CLAP parameter ID: {:?}", id);
+                return None;
+            }
+        }
+        let enum_param_hashes = param_id_hashes_ptrs_groups
+            .iter()
+            .filter_map(|(_, hash, param, _)| {
+                // The Params Arc keeps the parameter alive for the lifetime of this wrapper.
+                let valid = unsafe { has_enum_value_text(*param) };
+                valid.then_some(*hash)
             })
             .collect();
         let param_hashes = param_id_hashes_ptrs_groups
@@ -549,18 +570,6 @@ impl<P: ClapPlugin> Wrapper<P> {
             .collect();
 
         if cfg!(debug_assertions) {
-            let param_map = params.param_map();
-            let param_ids: HashSet<_> = param_id_hashes_ptrs_groups
-                .iter()
-                .map(|(id, _, _, _)| id.clone())
-                .collect();
-            crate::nice_debug_assert_eq!(
-                param_map.len(),
-                param_ids.len(),
-                "The plugin has duplicate parameter IDs, weird things may happen. Consider using \
-                 6 character parameter IDs to avoid collisions."
-            );
-
             let poly_mod_ids: HashSet<u32> = poly_mod_ids_by_hash.values().copied().collect();
             crate::nice_debug_assert_eq!(
                 poly_mod_ids_by_hash.len(),
@@ -703,6 +712,7 @@ impl<P: ClapPlugin> Wrapper<P> {
             param_hashes,
             param_by_hash,
             param_id_by_hash,
+            enum_param_hashes,
             param_group_by_hash,
             param_id_to_hash,
             param_ptr_to_hash,
@@ -817,7 +827,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                 .map(Mutex::new);
         }
 
-        wrapper
+        Some(wrapper)
     }
 
     #[cfg(feature = "editor")]
@@ -1656,9 +1666,6 @@ impl<P: ClapPlugin> Wrapper<P> {
             )
         });
         if !success {
-            crate::nice_debug_assert_failure!(
-                "Deserializing plugin state from a state object failed"
-            );
             return false;
         }
 
@@ -2304,8 +2311,8 @@ impl<P: ClapPlugin> Wrapper<P> {
 
     /// Looks up the numeric ID reported by CLAP params for an author's parameter ID.
     ///
-    /// Returns None for an unknown ID or an ambiguous inventory (duplicate author IDs or
-    /// numeric hash collisions). This uses the same maps as the live CLAP parameter wrapper.
+    /// Returns None for an unknown author ID. An initialized wrapper has a unique parameter
+    /// inventory. This uses the same maps as the live CLAP parameter wrapper.
     ///
     /// # Safety
     ///
@@ -2316,10 +2323,6 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) -> Option<clap_id> {
         check_null_ptr!(None, plugin, unsafe { (*plugin).plugin_data });
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
-        let count = wrapper.param_hashes.len();
-        if wrapper.param_id_to_hash.len() != count || wrapper.param_id_by_hash.len() != count {
-            return None;
-        }
         wrapper.param_id_to_hash.get(author_id).copied()
     }
 
@@ -3185,11 +3188,9 @@ impl<P: ClapPlugin> Wrapper<P> {
         check_null_ptr!(false, plugin, unsafe { (*plugin).plugin_data }, param_info);
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
 
-        if param_index > unsafe { Self::ext_params_count(plugin) } {
+        let Some(param_hash) = wrapper.param_hashes.get(param_index as usize) else {
             return false;
-        }
-
-        let param_hash = &wrapper.param_hashes[param_index as usize];
+        };
         let param_group = &wrapper.param_group_by_hash[param_hash];
         let param_ptr = &wrapper.param_by_hash[param_hash];
         let default_value = unsafe { param_ptr.default_normalized_value() };
@@ -3223,7 +3224,7 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
         if step_count.is_some() {
             param_info.flags |= CLAP_PARAM_IS_STEPPED;
-            if matches!(param_ptr, ParamPtr::EnumParam(_)) {
+            if wrapper.enum_param_hashes.contains(param_hash) {
                 param_info.flags |= CLAP_PARAM_IS_ENUM;
             }
         }
@@ -3238,7 +3239,7 @@ impl<P: ClapPlugin> Wrapper<P> {
         // range option
         // TODO: This should probably be encapsulated in some way so we don't forget about this in one place
         param_info.max_value = step_count.unwrap_or(1) as f64;
-        param_info.default_value = default_value as f64 * step_count.unwrap_or(1) as f64;
+        param_info.default_value = clap_plain_from_normalized(default_value, step_count);
 
         true
     }
@@ -3254,8 +3255,10 @@ impl<P: ClapPlugin> Wrapper<P> {
         match wrapper.param_by_hash.get(&param_id) {
             Some(param_ptr) => {
                 unsafe {
-                    *value = param_ptr.modulated_normalized_value() as f64
-                        * param_ptr.step_count().unwrap_or(1) as f64;
+                    *value = clap_plain_from_normalized(
+                        param_ptr.modulated_normalized_value(),
+                        param_ptr.step_count(),
+                    );
                 }
 
                 true
@@ -3283,7 +3286,7 @@ impl<P: ClapPlugin> Wrapper<P> {
                         dest,
                         // CLAP does not have a separate unit, so we'll include the unit here
                         &param_ptr.normalized_value_to_string(
-                            value as f32 / param_ptr.step_count().unwrap_or(1) as f32,
+                            clap_normalized_for_text(value, param_ptr.step_count()),
                             true,
                         ),
                     );
@@ -3319,11 +3322,11 @@ impl<P: ClapPlugin> Wrapper<P> {
             Some(param_ptr) => {
                 let normalized_value =
                     match unsafe { param_ptr.string_to_normalized_value(display) } {
-                        Some(v) => v as f64,
+                        Some(v) => v,
                         None => return false,
                     };
                 unsafe {
-                    *value = normalized_value * param_ptr.step_count().unwrap_or(1) as f64;
+                    *value = clap_plain_from_normalized(normalized_value, param_ptr.step_count());
                 }
 
                 true
@@ -3419,28 +3422,18 @@ impl<P: ClapPlugin> Wrapper<P> {
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
 
         let serialized = unsafe {
-            state::serialize_json::<P>(
+            state::serialize_json_bounded::<P>(
                 wrapper.params.clone(),
                 state::make_params_iter(&wrapper.param_by_hash, &wrapper.param_id_to_hash),
+                MAX_STATE_BYTES,
             )
         };
         match serialized {
             Ok(serialized) => {
-                // CLAP does not provide a way to tell how much data there is left in a stream, so
-                // we need to prepend it to our actual state data.
-                let length_bytes = (serialized.len() as u64).to_le_bytes();
-                if !write_stream(unsafe { &*stream }, &length_bytes) {
-                    crate::nice_error!(
-                        "Failed to save state: Error or end of stream while writing the state \
-                         length"
-                    );
-                    return false;
-                }
-                if !write_stream(unsafe { &*stream }, &serialized) {
-                    crate::nice_error!(
-                        "Failed to save state: Error or end of stream while writing the state \
-                         buffer"
-                    );
+                if let Err(error) =
+                    write_state_record(unsafe { &*stream }, &serialized, MAX_STATE_BYTES)
+                {
+                    crate::nice_error!("Failed to save state: {error}");
                     return false;
                 }
 
@@ -3462,40 +3455,15 @@ impl<P: ClapPlugin> Wrapper<P> {
         check_null_ptr!(false, plugin, unsafe { (*plugin).plugin_data }, stream);
         let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
 
-        // CLAP does not have a way to tell how much data there is left in a stream, so we've
-        // prepended the size in front of our JSON state
-        let mut length_bytes = [0u8; 8];
-        let bytes_read = read_stream(unsafe { &*stream }, length_bytes.as_mut_slice());
-        if bytes_read != Some(8) {
-            crate::nice_error!(
-                "Failed to load state: Error or end of stream while reading the state length"
-            );
-            return false;
-        }
-        let length = u64::from_le_bytes(length_bytes);
-        // Protect against OOM errors if the metadata is malformed.
-        if length > MAX_STATE_BYTES {
-            crate::nice_error!("Failed to load state: Malformed length");
-            return false;
-        }
-
-        let mut read_buffer: Vec<u8> = Vec::new();
-
-        if read_buffer.try_reserve_exact(length as usize).is_err() {
-            crate::nice_error!("Failed to load state: Failed to allocate buffer for state stream");
-            return false;
-        }
-
-        let bytes_read = read_stream(unsafe { &*stream }, read_buffer.spare_capacity_mut());
-        let Some(bytes_read) = bytes_read else {
-            crate::nice_error!("Failed to load state: Error while reading the state buffer");
-            return false;
+        let read_buffer = match read_state_record(unsafe { &*stream }, MAX_STATE_BYTES) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                crate::nice_error!("Failed to load state: {error}");
+                return false;
+            }
         };
-        unsafe {
-            read_buffer.set_len(bytes_read);
-        }
 
-        match unsafe { state::deserialize_json(&read_buffer) } {
+        match state::deserialize_json_bounded(&read_buffer, MAX_STATE_BYTES) {
             Some(mut state) => {
                 let success = wrapper.set_state_inner(&mut state);
                 if success {
@@ -3553,6 +3521,37 @@ impl<P: ClapPlugin> Wrapper<P> {
             None => false,
         }
     }
+}
+
+/// Converts the wrapper's normalized parameter representation to CLAP's plain values.
+pub(super) fn clap_plain_from_normalized(normalized: f32, step_count: Option<usize>) -> f64 {
+    match step_count {
+        Some(steps) => (f64::from(normalized) * steps as f64).round(),
+        None => f64::from(normalized),
+    }
+}
+
+fn clap_normalized_for_text(value: f64, step_count: Option<usize>) -> f32 {
+    // An enum with one variant has no steps and always uses its first label.
+    value as f32 / step_count.unwrap_or(1).max(1) as f32
+}
+
+/// The parameter pointer must be kept alive by the author's Params Arc.
+unsafe fn has_enum_value_text(param: ParamPtr) -> bool {
+    if !matches!(param, ParamPtr::EnumParam(_)) {
+        return false;
+    }
+    let Some(steps) = (unsafe { param.step_count() }) else {
+        return false;
+    };
+    (0..=steps).all(|index| {
+        let normalized = clap_normalized_for_text(index as f64, Some(steps));
+        let text = unsafe { param.normalized_value_to_string(normalized, true) };
+        let visible = text
+            .split_once('\0')
+            .map_or(text.as_str(), |(visible, _)| visible);
+        !visible.trim().is_empty()
+    })
 }
 
 /// Convenience function to query an extension from the host.

@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use nice_plug_core::{
     audio_setup::BufferConfig,
     params::{InternalParamMut, Param, Params, internals::ParamPtr},
@@ -88,35 +88,41 @@ pub(crate) unsafe fn serialize_object<'a, P: Plugin>(
     }
 }
 
-/// Serialize a plugin's state to a vector containing JSON data. This can (and should) be shared
-/// across plugin formats. If the `zstd` feature is enabled, then the state will be compressed using
-/// Zstandard.
+/// Serialize a plugin's state as JSON for the VST3 state stream.
+#[cfg(feature = "vst3")]
 pub(crate) unsafe fn serialize_json<'a, P: Plugin>(
     plugin_params: Arc<dyn Params>,
     params_iter: impl IntoIterator<Item = (&'a String, ParamPtr)>,
 ) -> Result<Vec<u8>> {
-    let plugin_state = unsafe { serialize_object::<P>(plugin_params, params_iter) };
-    let json = serde_json::to_vec(&plugin_state).context("Could not format as JSON")?;
+    unsafe { serialize_json_bounded::<P>(plugin_params, params_iter, usize::MAX) }
+}
+
+/// Serialize state with the same decoded and encoded size limit used on load.
+pub(crate) unsafe fn serialize_json_bounded<'a, P: Plugin>(
+    plugin_params: Arc<dyn Params>,
+    params_iter: impl IntoIterator<Item = (&'a String, ParamPtr)>,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    let state = unsafe { serialize_object::<P>(plugin_params, params_iter) };
+    encode_json(&state, limit)
+}
+
+fn encode_json(state: &PluginState, limit: usize) -> Result<Vec<u8>> {
+    let json = serde_json::to_vec(state).context("Could not format as JSON")?;
+    ensure!(json.len() <= limit, "Decoded state exceeds the size limit");
 
     #[cfg(feature = "zstd")]
     {
         let compressed = zstd::encode_all(json.as_slice(), zstd::DEFAULT_COMPRESSION_LEVEL)
             .context("Could not compress state")?;
-
-        let state_bytes = json.len();
-        let compressed_state_bytes = compressed.len();
-        let compression_ratio = compressed_state_bytes as f32 / state_bytes as f32 * 100.0;
-        nice_plug_core::nice_trace!(
-            "Compressed {state_bytes} bytes of state to {compressed_state_bytes} bytes \
-             ({compression_ratio:.1}% compression ratio)"
+        ensure!(
+            compressed.len() <= limit,
+            "Stored state exceeds the size limit"
         );
-
         Ok(compressed)
     }
     #[cfg(not(feature = "zstd"))]
-    {
-        Ok(json)
-    }
+    Ok(json)
 }
 
 /// Deserialize a plugin's state from a [`PluginState`] object. This is used to allow the plugin to
@@ -140,7 +146,48 @@ pub(crate) unsafe fn deserialize_object<P: Plugin>(
     // This lets the plugin perform migrations on old state if needed
     P::filter_state(state);
 
+    // Validate after the plugin's migration, before changing any persisted value or field.
+    // IDs removed in a newer version remain compatible.
+    for (param_id, value) in &state.params {
+        let Some(param) = params_getter(param_id) else {
+            continue;
+        };
+        let valid = match (param, value) {
+            (ParamPtr::FloatParam(_), ParamValue::F32(value)) => value.is_finite(),
+            (ParamPtr::IntParam(_), ParamValue::I32(_))
+            | (ParamPtr::BoolParam(_), ParamValue::Bool(_))
+            | (ParamPtr::EnumParam(_), ParamValue::String(_)) => true,
+            (ParamPtr::EnumParam(param), ParamValue::I32(index)) => {
+                // SAFETY: This pointer comes from the live parameter map.
+                usize::try_from(*index).is_ok_and(|index| index < unsafe { (*param).len() })
+            }
+            _ => false,
+        };
+        if !valid {
+            crate::nice_warn!("Invalid serialized value for parameter {param_id:?}");
+            return false;
+        }
+    }
+
     let sample_rate = current_buffer_config.map(|c| c.sample_rate);
+    // The pinned enum API only exposes a mutating stable-ID lookup. Resolve these first:
+    // a rejected ID leaves other parameters and fields unchanged, though earlier enum IDs
+    // in this same pass may already have been applied.
+    for (param_id, value) in &state.params {
+        if let (ParamValue::String(id), Some(ParamPtr::EnumParam(param))) =
+            (value, params_getter(param_id))
+        {
+            // SAFETY: This pointer comes from the live parameter map.
+            if !unsafe { (*param).set_from_id(id) } {
+                crate::nice_warn!("Unknown ID {id:?} for enum parameter {param_id:?}");
+                return false;
+            }
+            if let Some(sample_rate) = sample_rate {
+                unsafe { (*param)._internal_update_smoother(sample_rate, true) };
+            }
+        }
+    }
+
     for (param_id_str, param_value) in &state.params {
         let param_ptr = match params_getter(param_id_str.as_str()) {
             Some(ptr) => ptr,
@@ -168,26 +215,9 @@ pub(crate) unsafe fn deserialize_object<P: Plugin>(
                 (ParamPtr::EnumParam(p), ParamValue::I32(variant_idx)) => {
                     (*p)._internal_set_plain_value(*variant_idx);
                 }
-                (ParamPtr::EnumParam(p), ParamValue::String(id)) => {
-                    let deserialized_enum = (*p).set_from_id(id);
-                    if !deserialized_enum {
-                        #[cfg(debug_assertions)]
-                        crate::nice_warn!(
-                            "Unknown ID {:?} for enum parameter \"{}\"",
-                            id,
-                            param_id_str,
-                        );
-                    }
-                }
-                (param_ptr, param_value) => {
-                    #[cfg(debug_assertions)]
-                    crate::nice_warn!(
-                        "Invalid serialized value {:?} for parameter \"{}\" ({:?})",
-                        param_value,
-                        param_id_str,
-                        param_ptr,
-                    );
-                }
+                // Stable enum IDs were applied above.
+                (ParamPtr::EnumParam(_), ParamValue::String(_)) => continue,
+                _ => continue, // Already checked before applying any values.
             }
         }
 
@@ -204,57 +234,58 @@ pub(crate) unsafe fn deserialize_object<P: Plugin>(
     true
 }
 
-/// Deserialize a plugin's state from a vector containing (compressed) JSON data. Doesn't load the
-/// plugin state since doing so should be accompanied by calls to `Plugin::init()` and
-/// `Plugin::reset()`, and this way all of that behavior can be encapsulated so it can be reused in
-/// multiple places. The returned state object can be passed to [`deserialize_object()`].
+/// Decode VST3 state without applying it.
+#[cfg(feature = "vst3")]
 pub(crate) unsafe fn deserialize_json(state: &[u8]) -> Option<PluginState> {
-    #[cfg(feature = "zstd")]
-    let result: Option<PluginState> = match zstd::decode_all(state) {
-        Ok(decompressed) => match serde_json::from_slice(decompressed.as_slice()) {
-            Ok(s) => {
-                let state_bytes = decompressed.len();
-                let compressed_state_bytes = state.len();
-                let compression_ratio = compressed_state_bytes as f32 / state_bytes as f32 * 100.0;
-                crate::nice_trace!(
-                    "Inflated {compressed_state_bytes} bytes of state to {state_bytes} bytes \
-                     ({compression_ratio:.1}% compression ratio)"
-                );
+    deserialize_json_bounded(state, usize::MAX)
+}
 
-                Some(s)
-            }
-            Err(err) => {
-                crate::nice_debug_assert_failure!("Error while deserializing state: {}", err);
-                None
-            }
-        },
-        // Uncompressed state files can still be loaded after enabling this feature to prevent
-        // breaking existing plugin instances
-        Err(zstd_err) => match serde_json::from_slice(state) {
-            Ok(s) => {
-                crate::nice_trace!("Older uncompressed state found");
-                Some(s)
-            }
-            Err(json_err) => {
-                crate::nice_debug_assert_failure!(
-                    "Error while deserializing state as either compressed or uncompressed state: \
-                     {}, {}",
-                    zstd_err,
-                    json_err
-                );
-                None
-            }
-        },
-    };
-
-    #[cfg(not(feature = "zstd"))]
-    let result: Option<PluginState> = match serde_json::from_slice(state) {
-        Ok(s) => Some(s),
-        Err(err) => {
-            crate::nice_debug_assert_failure!("Error while deserializing state: {}", err);
+/// Decode bounded CLAP state without modifying any plugin parameters.
+pub(crate) fn deserialize_json_bounded(state: &[u8], limit: usize) -> Option<PluginState> {
+    match decode_json(state, limit) {
+        Ok(state) => Some(state),
+        Err(error) => {
+            crate::nice_warn!("Error while deserializing plugin state: {error}");
             None
         }
-    };
-
-    result
+    }
 }
+
+fn decode_json(state: &[u8], limit: usize) -> Result<PluginState> {
+    ensure!(state.len() <= limit, "Stored state exceeds the size limit");
+
+    #[cfg(feature = "zstd")]
+    {
+        // Old plugins could save plain JSON before compression was enabled. Try that format
+        // only if the compressed decoder fails, never after a successful but oversized decode.
+        if let Ok(decompressed) = decode_zstd(state, limit) {
+            ensure!(
+                decompressed.len() <= limit,
+                "Decoded state exceeds the size limit"
+            );
+            return serde_json::from_slice(&decompressed).context("Invalid plugin state JSON");
+        }
+    }
+    serde_json::from_slice(state).context("Invalid plugin state JSON")
+}
+
+#[cfg(feature = "zstd")]
+fn decode_zstd(state: &[u8], limit: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(state)?;
+    if limit != usize::MAX {
+        // Preserve the default compressor's working window even for short frames.
+        // Larger windows still cannot exceed the rounded-up state cap.
+        decoder.window_log_max((limit.max(1 << 21) - 1).ilog2() + 1)?;
+    }
+    let mut output = Vec::new();
+    // Read one extra byte to distinguish a document exactly at the cap from a longer one.
+    decoder
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut output)?;
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests;
