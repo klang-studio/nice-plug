@@ -170,21 +170,35 @@ pub(crate) unsafe fn deserialize_object<P: Plugin>(
     }
 
     let sample_rate = current_buffer_config.map(|c| c.sample_rate);
-    // The pinned enum API only exposes a mutating stable-ID lookup. Resolve these first:
-    // a rejected ID leaves other parameters and fields unchanged, though earlier enum IDs
-    // in this same pass may already have been applied.
+    // Resolving a stable ID uses the pinned enum API's setter. Retain the previous
+    // indices so a failed lookup can restore earlier changes via the usual callbacks.
+    let mut applied_enums = Vec::new();
     for (param_id, value) in &state.params {
         if let (ParamValue::String(id), Some(ParamPtr::EnumParam(param))) =
             (value, params_getter(param_id))
         {
             // SAFETY: This pointer comes from the live parameter map.
-            if !unsafe { (*param).set_from_id(id) } {
+            let param = unsafe { &*param };
+            let previous = param.unmodulated_plain_value();
+            if param.set_from_id(id) {
+                applied_enums.push((param, previous));
+            } else {
+                for (param, previous) in applied_enums.into_iter().rev() {
+                    // SAFETY: These are live parameters and state restore already holds
+                    // exclusive access. This index was read from the same parameter.
+                    unsafe { param._internal_set_plain_value(previous) };
+                }
                 crate::nice_warn!("Unknown ID {id:?} for enum parameter {param_id:?}");
                 return false;
             }
-            if let Some(sample_rate) = sample_rate {
-                unsafe { (*param)._internal_update_smoother(sample_rate, true) };
-            }
+        }
+    }
+
+    // Wait for all symbolic IDs to resolve before resetting any smoother.
+    if let Some(sample_rate) = sample_rate {
+        for (param, _) in applied_enums {
+            // SAFETY: State restore holds exclusive access to these live parameters.
+            unsafe { param._internal_update_smoother(sample_rate, true) };
         }
     }
 

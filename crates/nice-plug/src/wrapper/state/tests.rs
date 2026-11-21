@@ -7,7 +7,7 @@ use crate::prelude::{
 
 use super::*;
 
-#[derive(Clone, Copy, Enum, PartialEq)]
+#[derive(Clone, Copy, Debug, Enum, PartialEq)]
 enum Mode {
     #[id = "off"]
     Off,
@@ -19,15 +19,25 @@ struct StateParams {
     gain: FloatParam,
     mode: EnumParam<Mode>,
     secondary: EnumParam<Mode>,
+    tertiary: EnumParam<Mode>,
+    enum_changes: Arc<Mutex<Vec<(&'static str, Mode)>>>,
     remembered: Mutex<Option<String>>,
 }
 
 impl Default for StateParams {
     fn default() -> Self {
+        let enum_changes = Arc::new(Mutex::new(Vec::new()));
+        let record_change = |id| {
+            let changes = Arc::clone(&enum_changes);
+            Arc::new(move |mode| changes.lock().unwrap().push((id, mode)))
+        };
         Self {
             gain: FloatParam::new("Gain", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 }),
-            mode: EnumParam::new("Mode", Mode::Off),
-            secondary: EnumParam::new("Secondary mode", Mode::Off),
+            mode: EnumParam::new("Mode", Mode::Off).with_callback(record_change("mode")),
+            secondary: EnumParam::new("Secondary mode", Mode::On)
+                .with_callback(record_change("secondary")),
+            tertiary: EnumParam::new("Tertiary mode", Mode::Off),
+            enum_changes,
             remembered: Mutex::new(None),
         }
     }
@@ -48,11 +58,12 @@ unsafe impl Params for StateParams {
 }
 
 impl StateParams {
-    fn lookup(&self) -> [(&str, ParamPtr); 3] {
+    fn lookup(&self) -> [(&str, ParamPtr); 4] {
         [
             ("gain", self.gain.as_ptr()),
             ("mode", self.mode.as_ptr()),
             ("secondary", self.secondary.as_ptr()),
+            ("tertiary", self.tertiary.as_ptr()),
         ]
     }
 }
@@ -149,18 +160,44 @@ fn invalid_typed_value_leaves_the_existing_parameters_and_fields_unchanged() {
 }
 
 #[test]
-fn unknown_stable_enum_ids_fail_without_applying_other_values_or_fields() {
+fn unknown_stable_enum_id_rolls_back_earlier_changes_in_reverse_order() {
     let plugin = StatePlugin::default();
-    let json = br#"{"version":"1.0.0","params":{"gain":{"f32":0.25},"mode":{"string":"on"},"secondary":{"string":"unknown"}},"fields":{"remembered":"new"}}"#;
+    *plugin.0.remembered.lock().unwrap() = Some("existing".into());
+    let json = br#"{"version":"1.0.0","params":{"gain":{"f32":0.25},"mode":{"string":"on"},"secondary":{"string":"off"},"tertiary":{"string":"unknown"}},"fields":{"remembered":"new"}}"#;
     let mut state = deserialize_json_bounded(json, json.len()).unwrap();
     assert!(!apply(&mut state, &plugin));
     assert_eq!(plugin.0.gain.value(), 0.5);
-    assert!(plugin.0.secondary.value() == Mode::Off);
-    assert!(plugin.0.remembered.lock().unwrap().is_none());
+    assert_eq!(plugin.0.mode.value(), Mode::Off);
+    assert_eq!(plugin.0.secondary.value(), Mode::On);
+    assert_eq!(plugin.0.tertiary.value(), Mode::Off);
+    assert_eq!(
+        *plugin.0.remembered.lock().unwrap(),
+        Some("existing".into())
+    );
+    assert_eq!(
+        *plugin.0.enum_changes.lock().unwrap(),
+        [
+            ("mode", Mode::On),
+            ("secondary", Mode::Off),
+            ("secondary", Mode::On),
+            ("mode", Mode::Off),
+        ]
+    );
 
-    // The pinned setter resolves symbolic IDs by applying them. A prior successful setter can
-    // already have changed one enum when another symbolic ID proves invalid.
-    assert!(plugin.0.mode.value() == Mode::On);
+    state
+        .params
+        .insert("tertiary".into(), ParamValue::String("on".into()));
+    plugin.0.enum_changes.lock().unwrap().clear();
+    assert!(apply(&mut state, &plugin));
+    assert_eq!(plugin.0.gain.value(), 0.25);
+    assert_eq!(plugin.0.mode.value(), Mode::On);
+    assert_eq!(plugin.0.secondary.value(), Mode::Off);
+    assert_eq!(plugin.0.tertiary.value(), Mode::On);
+    assert_eq!(*plugin.0.remembered.lock().unwrap(), Some("new".into()));
+    assert_eq!(
+        *plugin.0.enum_changes.lock().unwrap(),
+        [("mode", Mode::On), ("secondary", Mode::Off)]
+    );
 }
 
 #[test]

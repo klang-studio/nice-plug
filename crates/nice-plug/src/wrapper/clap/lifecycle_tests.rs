@@ -1,4 +1,20 @@
+use std::cell::Cell;
 use std::ptr;
+
+thread_local! {
+    static RELEASES: Cell<usize> = const { Cell::new(0) };
+    static FLUSH_REQUESTS: Cell<usize> = const { Cell::new(0) };
+    static MAIN_CALLBACKS: Cell<usize> = const { Cell::new(0) };
+    static RESETS: Cell<usize> = const { Cell::new(0) };
+    static STATE_CONTENTION: Cell<Option<StateContention>> = const { Cell::new(None) };
+}
+
+struct StateContention {
+    plugin: *const clap_plugin,
+    process: *const clap_process,
+    flush_events: *const clap_input_events,
+    gain: u32,
+}
 
 use crate::prelude::{
     AudioIOLayout, AuxiliaryBuffers, Buffer, ClapFeature, FloatParam, FloatRange, Param, ParamPtr,
@@ -41,6 +57,7 @@ impl Plugin for TestPlugin {
         main_output_channels: NonZeroU32::new(2),
         ..AudioIOLayout::const_default()
     }];
+    const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
     type SysExMessage = ();
     type BackgroundTask = ();
     #[cfg(not(feature = "editor"))]
@@ -56,9 +73,45 @@ impl Plugin for TestPlugin {
         &mut self,
         _: &mut Buffer,
         _: &mut AuxiliaryBuffers,
-        _: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        while let Some(event) = context.next_event() {
+            if matches!(event, NoteEvent::NoteOff { timing: 0, .. }) {
+                RELEASES.set(RELEASES.get() + 1);
+            }
+        }
         ProcessStatus::Normal
+    }
+
+    fn reset(&mut self) {
+        RESETS.set(RESETS.get() + 1);
+    }
+
+    fn filter_state(_: &mut PluginState) {
+        if let Some(contention) = STATE_CONTENTION.take() {
+            // SAFETY: The test keeps these pointers valid until the synchronous load returns.
+            unsafe {
+                assert_eq!(
+                    Wrapper::<TestPlugin>::process(contention.plugin, contention.process),
+                    CLAP_PROCESS_CONTINUE
+                );
+                Wrapper::<TestPlugin>::ext_params_flush(
+                    contention.plugin,
+                    contention.flush_events,
+                    ptr::null(),
+                );
+                assert_eq!(MAIN_CALLBACKS.get(), 1);
+                Wrapper::<TestPlugin>::on_main_thread(contention.plugin);
+                assert_eq!(FLUSH_REQUESTS.get(), 0);
+                let mut gain = 0.0;
+                assert!(Wrapper::<TestPlugin>::ext_params_get_value(
+                    contention.plugin,
+                    contention.gain,
+                    &mut gain
+                ));
+                assert_eq!(gain, 0.5);
+            }
+        }
     }
 
     #[cfg(feature = "editor")]
@@ -130,11 +183,19 @@ fn a_pending_request_excludes_new_audio_and_does_not_wait_after_apply() {
 }
 
 #[test]
-fn state_apply_contention_silences_the_block_and_excludes_parameter_flush() {
+fn state_contention_silences_audio_and_replays_releases_and_parameter_flushes() {
     // SAFETY: The host is static and all callbacks and buffers below have the required lifetimes.
     unsafe {
-        let wrapper = Wrapper::<TestPlugin>::new(&HOST).unwrap();
-        let plugin = &*wrapper.clap_plugin.borrow();
+        let host = clap_host {
+            get_extension: Some(params_extension),
+            request_callback: Some(record_callback),
+            ..HOST
+        };
+        let wrapper = Wrapper::<TestPlugin>::new(&host).unwrap();
+        let plugin = wrapper.clap_plugin.as_ptr();
+        RELEASES.set(0);
+        FLUSH_REQUESTS.set(0);
+        MAIN_CALLBACKS.set(0);
         assert!(Wrapper::<TestPlugin>::init(plugin));
         assert!(Wrapper::<TestPlugin>::activate(plugin, 48_000.0, 1, 4));
         assert!(Wrapper::<TestPlugin>::start_processing(plugin));
@@ -160,6 +221,25 @@ fn state_apply_contention_silences_the_block_and_excludes_parameter_flush() {
             size: Some(one_input_event),
             get: Some(input_event),
         };
+        let release = clap_event_note {
+            header: clap_event_header {
+                size: mem::size_of::<clap_event_note>() as u32,
+                time: 3,
+                space_id: CLAP_CORE_EVENT_SPACE_ID,
+                type_: CLAP_EVENT_NOTE_OFF,
+                flags: 0,
+            },
+            note_id: 42,
+            port_index: 0,
+            channel: 0,
+            key: 60,
+            velocity: 0.0,
+        };
+        let releases = clap_input_events {
+            ctx: ptr::from_ref(&release).cast_mut().cast(),
+            size: Some(one_input_event),
+            get: Some(input_event),
+        };
         let mut left = [2.0_f32; 5];
         let mut right = [2.0_f32; 5];
         let mut channels = [left.as_mut_ptr(), right.as_mut_ptr()];
@@ -170,7 +250,7 @@ fn state_apply_contention_silences_the_block_and_excludes_parameter_flush() {
             latency: 0,
             constant_mask: 3,
         };
-        let process = clap_process {
+        let mut process = clap_process {
             steady_time: -1,
             frames_count: 4,
             transport: ptr::null(),
@@ -178,10 +258,50 @@ fn state_apply_contention_silences_the_block_and_excludes_parameter_flush() {
             audio_outputs: &mut output,
             audio_inputs_count: 0,
             audio_outputs_count: 1,
-            in_events: &events,
+            in_events: &releases,
             out_events: ptr::null(),
         };
 
+        STATE_CONTENTION.set(Some(StateContention {
+            plugin,
+            process: &process,
+            flush_events: &events,
+            gain: id,
+        }));
+        let mut state = wrapper.get_state_object();
+        assert!(wrapper.set_state_inner(&mut state));
+        assert_eq!(left, [0.0, 0.0, 0.0, 0.0, 2.0]);
+        assert_eq!(right, left);
+        assert_eq!(output.constant_mask, 0);
+        assert!(MAIN_CALLBACKS.get() >= 2);
+        Wrapper::<TestPlugin>::on_main_thread(plugin);
+        assert_eq!(FLUSH_REQUESTS.get(), 1);
+        Wrapper::<TestPlugin>::ext_params_flush(plugin, ptr::null(), ptr::null());
+        let mut gain = 0.0;
+        assert!(Wrapper::<TestPlugin>::ext_params_get_value(
+            plugin, id, &mut gain
+        ));
+        assert_eq!(gain, 0.25);
+        assert_eq!(RELEASES.get(), 0);
+        process.in_events = ptr::null();
+        assert_ne!(
+            Wrapper::<TestPlugin>::process(plugin, &process),
+            CLAP_PROCESS_ERROR
+        );
+        assert_eq!(RELEASES.get(), 1);
+        assert_ne!(
+            Wrapper::<TestPlugin>::process(plugin, &process),
+            CLAP_PROCESS_ERROR
+        );
+        assert_eq!(RELEASES.get(), 1);
+
+        let overflowing_releases = clap_input_events {
+            size: Some(overflow_input_events),
+            get: Some(repeated_input_event),
+            ..releases
+        };
+        let previous_resets = RESETS.get();
+        process.in_events = &overflowing_releases;
         wrapper
             .state_access
             .with_control(Duration::ZERO, || {
@@ -189,27 +309,95 @@ fn state_apply_contention_silences_the_block_and_excludes_parameter_flush() {
                     Wrapper::<TestPlugin>::process(plugin, &process),
                     CLAP_PROCESS_CONTINUE
                 );
-                Wrapper::<TestPlugin>::ext_params_flush(plugin, &events, ptr::null());
-                let mut gain = 0.0;
-                assert!(Wrapper::<TestPlugin>::ext_params_get_value(
-                    plugin, id, &mut gain
-                ));
-                assert_eq!(gain, 0.5);
             })
             .unwrap();
-        assert_eq!(left, [0.0, 0.0, 0.0, 0.0, 2.0]);
-        assert_eq!(right, left);
-        assert_eq!(output.constant_mask, 0);
-
-        Wrapper::<TestPlugin>::ext_params_flush(plugin, &events, ptr::null());
-        let mut gain = 0.0;
-        assert!(Wrapper::<TestPlugin>::ext_params_get_value(
-            plugin, id, &mut gain
-        ));
-        assert_eq!(gain, 0.25);
+        process.in_events = ptr::null();
+        assert_ne!(
+            Wrapper::<TestPlugin>::process(plugin, &process),
+            CLAP_PROCESS_ERROR
+        );
+        assert_eq!(RESETS.get(), previous_resets + 1);
+        assert_eq!(RELEASES.get(), 1);
+        assert!(wrapper.deferred_releases.is_empty());
         Wrapper::<TestPlugin>::stop_processing(plugin);
         Wrapper::<TestPlugin>::deactivate(plugin);
     }
+}
+
+const HOST_PARAMS: clap_host_params = clap_host_params {
+    rescan: Some(ignore_rescan),
+    clear: None,
+    request_flush: Some(record_flush),
+};
+
+unsafe extern "C" fn params_extension(_: *const clap_host, id: *const c_char) -> *const c_void {
+    if unsafe { CStr::from_ptr(id) } == CLAP_EXT_PARAMS {
+        ptr::from_ref(&HOST_PARAMS).cast()
+    } else {
+        ptr::null()
+    }
+}
+
+unsafe extern "C" fn ignore_rescan(_: *const clap_host, _: u32) {}
+
+unsafe extern "C" fn record_flush(_: *const clap_host) {
+    FLUSH_REQUESTS.set(FLUSH_REQUESTS.get() + 1);
+}
+
+unsafe extern "C" fn record_callback(_: *const clap_host) {
+    MAIN_CALLBACKS.set(MAIN_CALLBACKS.get() + 1);
+}
+
+#[cfg(feature = "editor")]
+#[test]
+fn busy_editor_state_is_retried_and_newer_host_state_supersedes_it() {
+    use nice_plug_core::plugin::ParamValue;
+
+    let wrapper = unsafe { Wrapper::<TestPlugin>::new(&HOST).unwrap() };
+    let mut editor_state = wrapper.get_state_object();
+    editor_state
+        .params
+        .insert("gain".into(), ParamValue::F32(0.25));
+    let active_audio = wrapper.state_access.try_audio().unwrap();
+    wrapper.apply_or_queue_editor_state(wrapper.next_revision(), editor_state, Duration::ZERO);
+    assert!(wrapper.pending_editor_state.lock().is_some());
+    drop(active_audio);
+
+    let plugin = wrapper.clap_plugin.as_ptr();
+    unsafe { Wrapper::<TestPlugin>::on_main_thread(plugin) };
+    assert!(wrapper.pending_editor_state.lock().is_none());
+    assert!(matches!(
+        wrapper.get_state_object().params.get("gain"),
+        Some(ParamValue::F32(0.25))
+    ));
+
+    let editor_state = wrapper.get_state_object();
+    let active_audio = wrapper.state_access.try_audio().unwrap();
+    wrapper.apply_or_queue_editor_state(wrapper.next_revision(), editor_state, Duration::ZERO);
+    drop(active_audio);
+
+    let mut host_state = wrapper.get_state_object();
+    host_state
+        .params
+        .insert("gain".into(), ParamValue::F32(0.75));
+    assert!(wrapper.set_state_inner(&mut host_state));
+    unsafe { Wrapper::<TestPlugin>::on_main_thread(plugin) };
+    assert!(wrapper.pending_editor_state.lock().is_none());
+    assert!(matches!(
+        wrapper.get_state_object().params.get("gain"),
+        Some(ParamValue::F32(0.75))
+    ));
+}
+
+unsafe extern "C" fn overflow_input_events(_: *const clap_input_events) -> u32 {
+    DEFERRED_EVENT_QUEUE_CAPACITY as u32 + 1
+}
+
+unsafe extern "C" fn repeated_input_event(
+    list: *const clap_input_events,
+    _: u32,
+) -> *const clap_event_header {
+    unsafe { (*list).ctx.cast() }
 }
 
 unsafe extern "C" fn one_input_event(_: *const clap_input_events) -> u32 {

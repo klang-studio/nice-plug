@@ -7,12 +7,14 @@ use super::*;
 
 struct ProbeParams {
     gain: FloatParam,
+    mix: FloatParam,
 }
 
 impl Default for ProbeParams {
     fn default() -> Self {
         Self {
             gain: FloatParam::new("Gain", 0.375, FloatRange::Linear { min: 0.0, max: 1.0 }),
+            mix: FloatParam::new("Mix", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 }),
         }
     }
 }
@@ -20,7 +22,10 @@ impl Default for ProbeParams {
 // SAFETY: The pointer refers to a parameter owned by the ProbeParams Arc.
 unsafe impl Params for ProbeParams {
     fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
-        vec![("gain".into(), self.gain.as_ptr(), String::new())]
+        vec![
+            ("gain".into(), self.gain.as_ptr(), String::new()),
+            ("mix".into(), self.mix.as_ptr(), String::new()),
+        ]
     }
 }
 
@@ -127,7 +132,7 @@ fn rejected_parameter_event_keeps_its_fifo_position_until_accepted() {
         },
         OutputParamEvent::EndGesture { param_hash: id },
     ] {
-        assert!(wrapper.output_parameter_events.push(event).is_ok());
+        assert!(wrapper.push_output_event(event));
     }
 
     let mut output = Output {
@@ -181,15 +186,10 @@ fn parameter_output_precedes_notes_without_applying_the_dsp_value_early() {
     assert!(unsafe { Wrapper::<QueueProbe>::init(plugin) });
     assert!(unsafe { Wrapper::<QueueProbe>::activate(plugin, 48_000.0, 1, 32) });
     assert!(unsafe { Wrapper::<QueueProbe>::start_processing(plugin) });
-    assert!(
-        wrapper
-            .output_parameter_events
-            .push(OutputParamEvent::SetValue {
-                param_hash: id,
-                clap_plain_value: 0.75,
-            })
-            .is_ok()
-    );
+    assert!(wrapper.push_output_event(OutputParamEvent::SetValue {
+        param_hash: id,
+        clap_plain_value: 0.75,
+    }));
     let mut output = Output {
         limit: 4,
         events: Vec::with_capacity(4),
@@ -229,4 +229,76 @@ fn parameter_output_precedes_notes_without_applying_the_dsp_value_early() {
 
 unsafe extern "C" fn no_host_extension(_: *const clap_host, _: *const c_char) -> *const c_void {
     ptr::null()
+}
+
+#[test]
+fn successful_restore_supersedes_older_matching_values_but_preserves_gestures_and_other_edits() {
+    use nice_plug_core::plugin::ParamValue;
+
+    let host = clap_host {
+        clap_version: clap_sys::version::CLAP_VERSION,
+        host_data: ptr::null_mut(),
+        name: c"Test".as_ptr(),
+        vendor: c"klang-studio".as_ptr(),
+        url: c"".as_ptr(),
+        version: c"1".as_ptr(),
+        get_extension: Some(no_host_extension),
+        request_restart: None,
+        request_process: None,
+        request_callback: None,
+    };
+    let wrapper = unsafe { Wrapper::<QueueProbe>::new(&host).unwrap() };
+    let plugin = wrapper.clap_plugin.as_ptr();
+    let id =
+        |name| unsafe { Wrapper::<QueueProbe>::custom_extension_param_id(plugin, name) }.unwrap();
+    let (gain, mix) = (id("gain"), id("mix"));
+    assert!(unsafe { Wrapper::<QueueProbe>::init(plugin) });
+    let value = |param_hash, clap_plain_value| OutputParamEvent::SetValue {
+        param_hash,
+        clap_plain_value,
+    };
+    for event in [
+        OutputParamEvent::BeginGesture { param_hash: gain },
+        value(gain, 0.75),
+        value(mix, 0.125),
+        value(gain, 0.625),
+        OutputParamEvent::EndGesture { param_hash: gain },
+    ] {
+        assert!(wrapper.push_output_event(event));
+    }
+    let mut output = Output {
+        limit: 1,
+        events: Vec::with_capacity(5),
+    };
+    let callbacks = clap_output_events {
+        ctx: ptr::from_mut(&mut output).cast(),
+        try_push: Some(try_push),
+    };
+    unsafe { Wrapper::<QueueProbe>::ext_params_flush(plugin, ptr::null(), &callbacks) };
+    assert!(wrapper.rejected_parameter_event.borrow().is_some());
+
+    let mut state = wrapper.get_state_object();
+    state.params.remove("mix");
+    state.params.insert("gain".into(), ParamValue::F32(0.25));
+    assert!(wrapper.set_state_inner(&mut state));
+    output.limit = 5;
+    unsafe { Wrapper::<QueueProbe>::ext_params_flush(plugin, ptr::null(), &callbacks) };
+    let mut current = 0.0;
+    assert!(unsafe { Wrapper::<QueueProbe>::ext_params_get_value(plugin, gain, &mut current) });
+    assert_eq!(current, 0.25);
+    assert!(unsafe { Wrapper::<QueueProbe>::ext_params_get_value(plugin, mix, &mut current) });
+    assert_eq!(current, 0.125);
+    assert_eq!(
+        output.events,
+        [
+            (0, CLAP_EVENT_PARAM_GESTURE_BEGIN),
+            (0, CLAP_EVENT_PARAM_VALUE),
+            (0, CLAP_EVENT_PARAM_GESTURE_END),
+        ]
+    );
+
+    assert!(wrapper.push_output_event(value(gain, 0.875)));
+    unsafe { Wrapper::<QueueProbe>::ext_params_flush(plugin, ptr::null(), &callbacks) };
+    assert!(unsafe { Wrapper::<QueueProbe>::ext_params_get_value(plugin, gain, &mut current) });
+    assert_eq!(current, 0.875);
 }
